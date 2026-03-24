@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import logging
 import os
 from abc import ABC, abstractmethod
@@ -56,3 +57,13 @@ class RewardManagerBase(ABC):
     @abstractmethod
     async def run_single(self, data: DataProto):
         raise NotImplementedError
+
+    async def run_batch(self, data: DataProto) -> list[dict]:
+        """Run reward computation for a batch.
+
+        Default behavior keeps backward compatibility by calling ``run_single``
+        per sample. Custom managers can override this to implement true
+        group-level/batch-level judging.
+        """
+        tasks = [self.run_single(data[i : i + 1]) for i in range(len(data))]
+        return await asyncio.gather(*tasks)

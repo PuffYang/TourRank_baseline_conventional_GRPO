@@ -15,6 +15,7 @@
 import asyncio
 import logging
 import os
+import zlib
 
 import aiohttp
 import numpy as np
@@ -131,11 +132,7 @@ class RewardLoopWorker:
         )
 
     async def compute_score_batch(self, data: DataProto) -> list[dict]:
-        tasks = []
-        for i in range(len(data)):
-            tasks.append(asyncio.create_task(self.compute_score(data[i : i + 1])))
-        outputs = await asyncio.gather(*tasks)
-        return outputs
+        return await self.reward_manager.run_batch(data)
 
     async def compute_score(self, data: DataProto) -> dict:
         assert len(data) == 1, "RewardLoopWorker only support single data item"
@@ -309,14 +306,49 @@ class RewardLoopManager:
         if self.reward_model_manager is not None:
             self.reward_model_manager.wake_up()
 
-        chunks = data.chunk(len(self.reward_loop_workers))
-        outputs = ray.get(
-            [
-                worker.compute_score_batch.remote(chunk)
-                for worker, chunk in zip(self.reward_loop_workers, chunks, strict=True)
-            ]
+        # Some reward managers (e.g. group-based LLM judges) require all rollouts
+        # of the same prompt uid to be processed by the same worker.
+        use_uid_dispatch = (
+            self.config.reward.reward_manager.name == "rubric_judge"
+            and "uid" in data.non_tensor_batch
+            and len(self.reward_loop_workers) > 1
         )
-        outputs_flat = [item for sublist in outputs for item in sublist]
+        if use_uid_dispatch:
+            uid_values = data.non_tensor_batch["uid"]
+            worker_to_indices: dict[int, list[int]] = {i: [] for i in range(len(self.reward_loop_workers))}
+            for global_idx, uid in enumerate(uid_values):
+                worker_idx = zlib.crc32(str(uid).encode("utf-8")) % len(self.reward_loop_workers)
+                worker_to_indices[worker_idx].append(global_idx)
+
+            calls = []
+            call_metas = []
+            for worker_idx, indices in worker_to_indices.items():
+                if len(indices) == 0:
+                    continue
+                chunk = data.select_idxs(indices)
+                calls.append(self.reward_loop_workers[worker_idx].compute_score_batch.remote(chunk))
+                call_metas.append(indices)
+
+            outputs = ray.get(calls)
+            outputs_flat: list[dict | None] = [None] * len(data)
+            for indices, worker_output in zip(call_metas, outputs, strict=True):
+                assert len(indices) == len(worker_output), (
+                    f"Reward output size mismatch: got {len(worker_output)} outputs for {len(indices)} inputs."
+                )
+                for local_idx, global_idx in enumerate(indices):
+                    outputs_flat[global_idx] = worker_output[local_idx]
+
+            assert all(item is not None for item in outputs_flat), "Some reward results are missing after uid dispatch."
+            outputs_flat = [item for item in outputs_flat if item is not None]
+        else:
+            chunks = data.chunk(len(self.reward_loop_workers))
+            outputs = ray.get(
+                [
+                    worker.compute_score_batch.remote(chunk)
+                    for worker, chunk in zip(self.reward_loop_workers, chunks, strict=True)
+                ]
+            )
+            outputs_flat = [item for sublist in outputs for item in sublist]
 
         # compute rm score
         scores = [item["reward_score"] for item in outputs_flat]
