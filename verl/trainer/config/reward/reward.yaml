@@ -66,3 +66,22 @@ sandbox_fusion:
   max_concurrent: 64
   # Max memory limit for each sandbox process in MB
   memory_limit_mb: 1024
+
+# GPT rubric judge options for group-wise rollout ranking.
+gpt_judge:
+  model: gpt-4o
+  api_key: null
+  api_version: "2024-06-01"
+  azure_endpoint: null
+  temperature: 0.0
+  max_tokens: 1200
+  timeout: 200
+  max_retries: 3
+  retry_sleep: 1.5
+  n_rollouts: ${actor_rollout_ref.rollout.n}
+  strict_n_rollouts: False
+  max_rollout_chars: 12000
+  fallback_to_first_on_error: True
+  win_score: 1.0
+  lose_score: 0.0
+  rollout_save_dir: null

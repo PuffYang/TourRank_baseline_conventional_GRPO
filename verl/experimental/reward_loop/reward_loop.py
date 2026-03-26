@@ -138,6 +138,11 @@ class RewardLoopWorker:
         )
 
     async def compute_score_batch(self, data: DataProto) -> list[dict]:
+        if hasattr(self.reward_manager, "run_batch"):
+            run_batch_fn = getattr(self.reward_manager, "run_batch")
+            if callable(run_batch_fn):
+                return await run_batch_fn(data)
+
         tasks = []
         for i in range(len(data)):
             tasks.append(asyncio.create_task(self.compute_score(data[i : i + 1])))
@@ -331,13 +336,17 @@ class RewardLoopManager:
         if self.reward_model_manager is not None:
             self.reward_model_manager.wake_up()
 
-        chunks = data.chunk(len(self.reward_loop_workers))
-        outputs = ray.get(
-            [
-                worker.compute_score_batch.remote(chunk)
-                for worker, chunk in zip(self.reward_loop_workers, chunks, strict=True)
-            ]
-        )
+        if self.config.reward.reward_manager.name == "rubric_gpt_judge":
+            # Keep the full batch in one worker to preserve group-wise comparison among rollouts.
+            outputs = [ray.get(self.reward_loop_workers[0].compute_score_batch.remote(data))]
+        else:
+            chunks = data.chunk(len(self.reward_loop_workers))
+            outputs = ray.get(
+                [
+                    worker.compute_score_batch.remote(chunk)
+                    for worker, chunk in zip(self.reward_loop_workers, chunks, strict=True)
+                ]
+            )
         outputs_flat = [item for sublist in outputs for item in sublist]
 
         # compute rm score
