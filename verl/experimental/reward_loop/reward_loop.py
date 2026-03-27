@@ -336,8 +336,13 @@ class RewardLoopManager:
         if self.reward_model_manager is not None:
             self.reward_model_manager.wake_up()
 
-        if self.config.reward.reward_manager.name == "rubric_gpt_judge":
-            # Keep the full batch in one worker to preserve group-wise comparison among rollouts.
+        use_single_worker_for_judge = (
+            self.config.reward.reward_manager.name == "rubric_gpt_judge"
+            and self.config.reward.get("gpt_judge", {}).get("dispatch_full_batch_to_single_worker", False)
+        )
+
+        if use_single_worker_for_judge:
+            # Optional compatibility mode for group-wise judge variants.
             outputs = [ray.get(self.reward_loop_workers[0].compute_score_batch.remote(data))]
         else:
             chunks = data.chunk(len(self.reward_loop_workers))

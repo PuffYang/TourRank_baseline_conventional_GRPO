@@ -46,6 +46,8 @@ class RubricGPTJudgeRewardManager(RewardManagerBase):
         self.timeout = int(judge_cfg.get("timeout", 200))
         self.max_retries = int(judge_cfg.get("max_retries", 3))
         self.retry_sleep = float(judge_cfg.get("retry_sleep", 1.5))
+        self.n_rollouts = int(judge_cfg.get("n_rollouts", config.actor_rollout_ref.rollout.n))
+        self.strict_n_rollouts = bool(judge_cfg.get("strict_n_rollouts", False))
 
         self.max_rollout_chars = int(judge_cfg.get("max_rollout_chars", 12000))
         self.fallback_to_first_on_error = bool(judge_cfg.get("fallback_to_first_on_error", True))
@@ -83,6 +85,12 @@ class RubricGPTJudgeRewardManager(RewardManagerBase):
             rollout_dir.mkdir(parents=True, exist_ok=True)
             self.rollout_save_path = rollout_dir / f"gpt_judge_rollouts_worker_{os.getpid()}.jsonl"
 
+        if self.strict_n_rollouts:
+            logger.warning(
+                "strict_n_rollouts=True is ignored in single-rollout judge mode. "
+                "Each rollout is judged independently."
+            )
+
     async def run_single(self, data: DataProto) -> dict:
         """Score a single rollout with one GPT call."""
         assert len(data) == 1, "Only support single data item"
@@ -111,9 +119,11 @@ class RubricGPTJudgeRewardManager(RewardManagerBase):
     def _score_item(self, data_item: DataProto, global_step: int, group_id: int, rollout_index: int) -> dict:
         query, rubrics = self._extract_query_and_rubrics(data_item)
         rollout_text = self._extract_response_text(data_item)
+        judge_prompt = self._build_judge_prompt(query=query, rubrics=rubrics, rollout_text=rollout_text)
+        judge_raw_output = ""
 
         try:
-            judge_result = self._judge_rollout(query=query, rubrics=rubrics, rollout_text=rollout_text)
+            judge_result, judge_raw_output = self._judge_rollout(judge_prompt=judge_prompt)
             raw_score = self._extract_single_score(judge_result)
             normalized_score = self._normalize_single_score(raw_score)
             reason = str(judge_result.get("reason", "")).strip()
@@ -133,9 +143,12 @@ class RubricGPTJudgeRewardManager(RewardManagerBase):
                 "uid": uid,
                 "group_id": group_id,
                 "rollout_index": rollout_index,
+                "expected_n_rollouts": self.n_rollouts,
                 "query": query,
                 "rubrics": rubrics,
                 "response": rollout_text,
+                "judge_prompt": judge_prompt,
+                "judge_raw_output": judge_raw_output,
                 "raw_score": float(raw_score),
                 "normalized_score": float(normalized_score),
                 "reason": reason,
@@ -188,8 +201,7 @@ class RubricGPTJudgeRewardManager(RewardManagerBase):
             response = response[: self.max_rollout_chars]
         return response
 
-    def _judge_rollout(self, query: str, rubrics: list[dict[str, Any]], rollout_text: str) -> dict[str, Any]:
-        prompt = self._build_judge_prompt(query=query, rubrics=rubrics, rollout_text=rollout_text)
+    def _judge_rollout(self, judge_prompt: str) -> tuple[dict[str, Any], str]:
         last_error = ""
 
         for attempt in range(1, self.max_retries + 1):
@@ -204,14 +216,14 @@ class RubricGPTJudgeRewardManager(RewardManagerBase):
                                 "Return only valid JSON without markdown."
                             ),
                         },
-                        {"role": "user", "content": prompt},
+                        {"role": "user", "content": judge_prompt},
                     ],
                     temperature=self.temperature,
                     max_tokens=self.max_tokens,
                     timeout=self.timeout,
                 )
                 content = resp.choices[0].message.content or ""
-                return self._parse_judge_output(content)
+                return self._parse_judge_output(content), content
             except Exception as exc:
                 last_error = str(exc)
                 if attempt < self.max_retries:
@@ -274,11 +286,11 @@ class RubricGPTJudgeRewardManager(RewardManagerBase):
         rubric_lines = []
         for i, item in enumerate(rubrics):
             title = str(item.get("title", "")).strip()
-            rubric = str(item.get("rubric", item.get("description", ""))).strip()
+            description = str(item.get("description", item.get("rubric", ""))).strip()
             weight = item.get("weight", 1)
             rubric_lines.append(
                 f"{i + 1}. title: {title}\n"
-                f"   rubric: {rubric}\n"
+                f"   description: {description}\n"
                 f"   weight: {weight}"
             )
         rubric_block = "\n".join(rubric_lines) if rubric_lines else "No rubrics provided."
@@ -290,10 +302,11 @@ class RubricGPTJudgeRewardManager(RewardManagerBase):
             f"{query}\n\n"
             "Response:\n"
             f"{rollout_text}\n\n"
-            "Rubric (title, rubric, weight):\n"
+            "Rubric (title, description, weight):\n"
             f"{rubric_block}\n\n"
             "Scoring rule:\n"
             "- Return one final score in [0, 10], where 0 is worst and 10 is best.\n"
+            "- Weight indicates relative importance among rubric items, not a normalized coefficient.\n"
             "- Do not output explanations.\n"
             "- Output must be JSON only, with this schema:\n"
             '{\n  "score": 7.5\n}\n'
