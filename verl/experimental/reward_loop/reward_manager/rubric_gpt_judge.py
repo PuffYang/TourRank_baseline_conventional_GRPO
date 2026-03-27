@@ -16,7 +16,6 @@ import json
 import logging
 import os
 import time
-from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
@@ -35,7 +34,7 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 @register("rubric_gpt_judge")
 class RubricGPTJudgeRewardManager(RewardManagerBase):
-    """Group-wise GRPO reward manager using rubric-based GPT judge."""
+    """LLM-as-judge reward manager that scores each rollout independently."""
 
     def __init__(self, config: DictConfig, tokenizer, compute_score, reward_router_address=None, reward_model_tokenizer=None):
         super().__init__(config, tokenizer, compute_score)
@@ -48,19 +47,15 @@ class RubricGPTJudgeRewardManager(RewardManagerBase):
         self.max_retries = int(judge_cfg.get("max_retries", 3))
         self.retry_sleep = float(judge_cfg.get("retry_sleep", 1.5))
 
-        self.n_rollouts = int(judge_cfg.get("n_rollouts", config.actor_rollout_ref.rollout.n))
-        self.strict_n_rollouts = bool(judge_cfg.get("strict_n_rollouts", False))
         self.max_rollout_chars = int(judge_cfg.get("max_rollout_chars", 12000))
         self.fallback_to_first_on_error = bool(judge_cfg.get("fallback_to_first_on_error", True))
 
-        # Judge returns per-rollout raw scores (default expected range: [0, 10]).
+        # Judge returns raw score in [score_range_min, score_range_max], default [0, 10].
         # reward_score used by trainer is normalized into [0, 1].
-        self.score_normalization = str(judge_cfg.get("score_normalization", "group_minmax"))
+        self.score_normalization = str(judge_cfg.get("score_normalization", "fixed_range"))
         self.score_range_min = float(judge_cfg.get("score_range_min", 0.0))
         self.score_range_max = float(judge_cfg.get("score_range_max", 10.0))
         self.equal_score_reward = float(judge_cfg.get("equal_score_reward", 0.5))
-
-        self.win_score = float(judge_cfg.get("win_score", 1.0))
         self.lose_score = float(judge_cfg.get("lose_score", 0.0))
 
         api_key = judge_cfg.get("api_key") or os.getenv("AZURE_OPENAI_API_KEY")
@@ -72,6 +67,8 @@ class RubricGPTJudgeRewardManager(RewardManagerBase):
             raise ValueError(
                 "Missing Azure OpenAI endpoint. Set reward.gpt_judge.azure_endpoint or AZURE_OPENAI_ENDPOINT."
             )
+
+        # Kept in the same style as user-provided Azure OpenAI snippet.
         self.client = AzureOpenAI(
             api_key=api_key,
             api_version=api_version,
@@ -87,118 +84,77 @@ class RubricGPTJudgeRewardManager(RewardManagerBase):
             self.rollout_save_path = rollout_dir / f"gpt_judge_rollouts_worker_{os.getpid()}.jsonl"
 
     async def run_single(self, data: DataProto) -> dict:
-        """Fallback single-sample scoring."""
+        """Score a single rollout with one GPT call."""
         assert len(data) == 1, "Only support single data item"
-        return {
-            "reward_score": 1.0,
-            "reward_extra_info": {
-                "acc": 1.0,
-                "gpt_judge_score": 1.0,
-                "gpt_judge_raw_score": self.score_range_max,
-                "gpt_judge_normalized_score": 1.0,
-                "gpt_judge_winners": json.dumps([0], ensure_ascii=False),
-                "gpt_judge_reason": "single rollout fallback (score mode)",
-                "gpt_judge_group_id": 0,
-                "gpt_judge_rollout_index": 0,
-            },
-        }
+        output = self._score_item(
+            data_item=data[0],
+            global_step=int(data.meta_info.get("global_steps", -1)),
+            group_id=0,
+            rollout_index=0,
+        )
+        return output
 
     async def run_batch(self, data: DataProto) -> list[dict]:
-        """Compute group-wise rewards by judging n rollouts from the same uid together."""
-        grouped_indices: dict[str, list[int]] = defaultdict(list)
-        uids = data.non_tensor_batch.get("uid", [])
-        for idx, uid in enumerate(uids):
-            grouped_indices[str(uid)].append(idx)
-
-        outputs: list[dict[str, Any] | None] = [None for _ in range(len(data))]
-        for group_id, (uid, indices) in enumerate(grouped_indices.items()):
-            if self.strict_n_rollouts and len(indices) != self.n_rollouts:
-                raise ValueError(
-                    f"Group uid={uid} has {len(indices)} rollouts, expected n_rollouts={self.n_rollouts}."
-                )
-
-            first_item = data[indices[0]]
-            ground_truth = first_item.non_tensor_batch.get("reward_model", {}).get("ground_truth", {}) or {}
-            query = str(ground_truth.get("query", "")).strip() or self._extract_prompt_text(first_item)
-            rubrics = ground_truth.get("rubrics", [])
-            rollout_texts = [self._extract_response_text(data[idx]) for idx in indices]
-
-            judge_result = self._judge_group(
-                group_id=group_id,
-                query=query,
-                rubrics=rubrics,
-                rollout_texts=rollout_texts,
+        """Score each rollout independently (one rollout per prompt to GPT)."""
+        outputs: list[dict] = []
+        global_step = int(data.meta_info.get("global_steps", -1))
+        for idx in range(len(data)):
+            output = self._score_item(
+                data_item=data[idx],
+                global_step=global_step,
+                group_id=idx,
+                rollout_index=0,
             )
-            raw_scores = self._extract_group_scores(judge_result=judge_result, num_rollouts=len(rollout_texts))
-            normalized_scores = self._normalize_group_scores(raw_scores)
-
-            winners = self._normalize_winners(judge_result.get("winners", []), len(rollout_texts))
-            if not winners:
-                max_score = max(normalized_scores)
-                winners = [i for i, s in enumerate(normalized_scores) if abs(s - max_score) < 1e-8]
-            reason = str(judge_result.get("reason", "")).strip()
-
-            group_rollout_records = []
-            for local_idx, data_idx in enumerate(indices):
-                reward = float(normalized_scores[local_idx])
-                outputs[data_idx] = {
-                    "reward_score": reward,
-                    "reward_extra_info": {
-                        "acc": reward,
-                        "gpt_judge_score": reward,
-                        "gpt_judge_raw_score": float(raw_scores[local_idx]),
-                        "gpt_judge_normalized_score": reward,
-                        "gpt_judge_winners": json.dumps(winners, ensure_ascii=False),
-                        "gpt_judge_reason": reason,
-                        "gpt_judge_group_id": group_id,
-                        "gpt_judge_rollout_index": local_idx,
-                    },
-                }
-                group_rollout_records.append(
-                    {
-                        "rollout_index": local_idx,
-                        "response": rollout_texts[local_idx],
-                        "raw_score": float(raw_scores[local_idx]),
-                        "reward": float(reward),
-                    }
-                )
-
-            self._append_rollout_record(
-                {
-                    "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-                    "global_step": int(data.meta_info.get("global_steps", -1)),
-                    "uid": uid,
-                    "group_id": group_id,
-                    "n_rollouts": len(indices),
-                    "query": query,
-                    "rubrics": rubrics,
-                    "winners": winners,
-                    "raw_scores": [float(x) for x in raw_scores],
-                    "normalized_scores": [float(x) for x in normalized_scores],
-                    "reason": reason,
-                    "rollouts": group_rollout_records,
-                    "judge_model": self.model,
-                }
-            )
-
-        # Fallback for unexpected empty positions
-        for i, item in enumerate(outputs):
-            if item is None:
-                outputs[i] = {
-                    "reward_score": self.lose_score,
-                    "reward_extra_info": {
-                        "acc": self.lose_score,
-                        "gpt_judge_score": self.lose_score,
-                        "gpt_judge_raw_score": self.score_range_min,
-                        "gpt_judge_normalized_score": self.lose_score,
-                        "gpt_judge_winners": "[]",
-                        "gpt_judge_reason": "fallback: missing group output",
-                        "gpt_judge_group_id": -1,
-                        "gpt_judge_rollout_index": -1,
-                    },
-                }
-
+            outputs.append(output)
         return outputs
+
+    def _score_item(self, data_item: DataProto, global_step: int, group_id: int, rollout_index: int) -> dict:
+        query, rubrics = self._extract_query_and_rubrics(data_item)
+        rollout_text = self._extract_response_text(data_item)
+
+        try:
+            judge_result = self._judge_rollout(query=query, rubrics=rubrics, rollout_text=rollout_text)
+            raw_score = self._extract_single_score(judge_result)
+            normalized_score = self._normalize_single_score(raw_score)
+            reason = str(judge_result.get("reason", "")).strip()
+        except Exception as exc:
+            if not self.fallback_to_first_on_error:
+                raise
+            reason = f"fallback due to judge error: {exc}"
+            raw_score = self.score_range_min
+            normalized_score = self.lose_score
+            logger.warning("Judge failed for group=%s rollout=%s, fallback to lose_score. error=%s", group_id, rollout_index, exc)
+
+        uid = str(data_item.non_tensor_batch.get("uid", ""))
+        self._append_rollout_record(
+            {
+                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                "global_step": global_step,
+                "uid": uid,
+                "group_id": group_id,
+                "rollout_index": rollout_index,
+                "query": query,
+                "rubrics": rubrics,
+                "response": rollout_text,
+                "raw_score": float(raw_score),
+                "normalized_score": float(normalized_score),
+                "reason": reason,
+                "judge_model": self.model,
+            }
+        )
+
+        return {
+            "reward_score": float(normalized_score),
+            "reward_extra_info": {
+                "acc": float(normalized_score),
+                "gpt_judge_score": float(normalized_score),
+                "gpt_judge_raw_score": float(raw_score),
+                "gpt_judge_normalized_score": float(normalized_score),
+                "gpt_judge_reason": reason,
+                "gpt_judge_group_id": group_id,
+                "gpt_judge_rollout_index": rollout_index,
+            },
+        }
 
     def _append_rollout_record(self, record: dict[str, Any]) -> None:
         if self.rollout_save_path is None:
@@ -206,6 +162,14 @@ class RubricGPTJudgeRewardManager(RewardManagerBase):
         with self._io_lock:
             with self.rollout_save_path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def _extract_query_and_rubrics(self, data_item: DataProto) -> tuple[str, list[dict[str, Any]]]:
+        ground_truth = data_item.non_tensor_batch.get("reward_model", {}).get("ground_truth", {}) or {}
+        query = str(ground_truth.get("query", "")).strip() or self._extract_prompt_text(data_item)
+        rubrics = ground_truth.get("rubrics", [])
+        if not isinstance(rubrics, list):
+            rubrics = []
+        return query, rubrics
 
     def _extract_prompt_text(self, data_item: DataProto) -> str:
         prompt_ids = data_item.batch["prompts"]
@@ -224,10 +188,10 @@ class RubricGPTJudgeRewardManager(RewardManagerBase):
             response = response[: self.max_rollout_chars]
         return response
 
-    def _judge_group(self, group_id: int, query: str, rubrics: list[dict[str, Any]], rollout_texts: list[str]) -> dict[str, Any]:
-        prompt = self._build_judge_prompt(group_id=group_id, query=query, rubrics=rubrics, rollout_texts=rollout_texts)
-
+    def _judge_rollout(self, query: str, rubrics: list[dict[str, Any]], rollout_text: str) -> dict[str, Any]:
+        prompt = self._build_judge_prompt(query=query, rubrics=rubrics, rollout_text=rollout_text)
         last_error = ""
+
         for attempt in range(1, self.max_retries + 1):
             try:
                 resp = self.client.chat.completions.create(
@@ -236,7 +200,7 @@ class RubricGPTJudgeRewardManager(RewardManagerBase):
                         {
                             "role": "system",
                             "content": (
-                                "You are a strict JSON judge for ranking multiple candidate answers. "
+                                "You are a strict deep-research scoring expert. "
                                 "Return only valid JSON without markdown."
                             ),
                         },
@@ -247,114 +211,55 @@ class RubricGPTJudgeRewardManager(RewardManagerBase):
                     timeout=self.timeout,
                 )
                 content = resp.choices[0].message.content or ""
-                parsed = json.loads(self._strip_markdown_json_fence(content))
-                if not isinstance(parsed, dict):
-                    raise ValueError("Judge output must be a JSON object.")
-                return parsed
+                return self._parse_judge_output(content)
             except Exception as exc:
                 last_error = str(exc)
                 if attempt < self.max_retries:
                     time.sleep(self.retry_sleep * attempt)
 
-        if self.fallback_to_first_on_error:
-            logger.warning("Judge failed for group %s after retries, fallback to first winner. error=%s", group_id, last_error)
-            scores = [self.score_range_min for _ in rollout_texts]
-            if scores:
-                scores[0] = self.score_range_max
-            return {
-                "group_id": group_id,
-                "scores": scores,
-                "winners": [0],
-                "reason": f"fallback due to judge error: {last_error}",
-            }
         raise RuntimeError(last_error)
 
-    @staticmethod
-    def _normalize_winners(winners: Any, num_rollouts: int) -> list[int]:
-        if not isinstance(winners, list):
-            return []
+    def _parse_judge_output(self, text: str) -> dict[str, Any]:
+        cleaned = self._strip_markdown_json_fence(text)
 
-        normalized: list[int] = []
-        for item in winners:
-            try:
-                idx = int(item)
-            except Exception:
-                continue
-            normalized.append(idx)
+        # Primary path: strict JSON object.
+        try:
+            parsed = json.loads(cleaned)
+        except Exception:
+            parsed = None
 
-        if not normalized:
-            return []
+        if isinstance(parsed, dict):
+            return parsed
 
-        # Support both 0-based and 1-based indices.
-        if all(1 <= idx <= num_rollouts for idx in normalized) and 0 not in normalized:
-            normalized = [idx - 1 for idx in normalized]
+        # Tolerate plain numeric outputs.
+        if isinstance(parsed, (int, float)):
+            return {"score": float(parsed)}
 
-        deduped = []
-        seen = set()
-        for idx in normalized:
-            if 0 <= idx < num_rollouts and idx not in seen:
-                seen.add(idx)
-                deduped.append(idx)
+        try:
+            return {"score": float(cleaned)}
+        except Exception as exc:
+            raise ValueError(f"Judge output is not valid JSON score: {cleaned}") from exc
 
-        return deduped
+    def _extract_single_score(self, judge_result: dict[str, Any]) -> float:
+        if "score" in judge_result:
+            return float(judge_result["score"])
+        if "final_score" in judge_result:
+            return float(judge_result["final_score"])
+        scores = judge_result.get("scores")
+        if isinstance(scores, list) and len(scores) > 0:
+            return float(scores[0])
+        raise ValueError(f"Judge JSON missing score field: {judge_result}")
 
-    def _extract_group_scores(self, judge_result: dict[str, Any], num_rollouts: int) -> list[float]:
-        raw_scores = judge_result.get("scores")
-        if isinstance(raw_scores, list):
-            # Case 1: dense numeric list with same order as rollout indices.
-            if len(raw_scores) == num_rollouts and all(not isinstance(x, dict) for x in raw_scores):
-                dense_scores = []
-                for item in raw_scores:
-                    try:
-                        dense_scores.append(float(item))
-                    except Exception:
-                        dense_scores.append(self.score_range_min)
-                return dense_scores
+    def _normalize_single_score(self, raw_score: float) -> float:
+        clipped = min(self.score_range_max, max(self.score_range_min, float(raw_score)))
+        denom = self.score_range_max - self.score_range_min
+        if denom <= 1e-12:
+            return float(self.equal_score_reward)
 
-            # Case 2: sparse list of {"index": i, "score": s}.
-            indexed_scores = [self.score_range_min for _ in range(num_rollouts)]
-            any_indexed = False
-            for item in raw_scores:
-                if not isinstance(item, dict):
-                    continue
-                try:
-                    idx = int(item.get("index"))
-                    score = float(item.get("score"))
-                except Exception:
-                    continue
-                if 0 <= idx < num_rollouts:
-                    indexed_scores[idx] = score
-                    any_indexed = True
-            if any_indexed:
-                return indexed_scores
-
-        # Backward-compatible fallback: derive raw scores from winners.
-        winners = self._normalize_winners(judge_result.get("winners", []), num_rollouts)
-        scores = [self.score_range_min for _ in range(num_rollouts)]
-        for idx in winners:
-            scores[idx] = self.score_range_max
-        if not winners and scores:
-            scores[0] = self.score_range_max
-        return scores
-
-    def _normalize_group_scores(self, raw_scores: list[float]) -> list[float]:
-        if not raw_scores:
-            return []
-
-        clipped = [min(self.score_range_max, max(self.score_range_min, float(s))) for s in raw_scores]
-
-        if self.score_normalization == "fixed_range":
-            denom = self.score_range_max - self.score_range_min
-            if denom <= 1e-12:
-                return [self.equal_score_reward for _ in clipped]
-            return [min(1.0, max(0.0, (s - self.score_range_min) / denom)) for s in clipped]
-
-        # Default: group-wise min-max normalization.
-        s_min = min(clipped)
-        s_max = max(clipped)
-        if s_max - s_min <= 1e-12:
-            return [self.equal_score_reward for _ in clipped]
-        return [(s - s_min) / (s_max - s_min) for s in clipped]
+        # Single-rollout scoring has no meaningful group min-max; use fixed-range mapping.
+        if self.score_normalization not in {"fixed_range", "group_minmax"}:
+            logger.warning("Unknown score_normalization=%s, fallback to fixed_range.", self.score_normalization)
+        return min(1.0, max(0.0, (clipped - self.score_range_min) / denom))
 
     @staticmethod
     def _strip_markdown_json_fence(text: str) -> str:
@@ -365,45 +270,31 @@ class RubricGPTJudgeRewardManager(RewardManagerBase):
                 cleaned = cleaned[4:]
         return cleaned.strip()
 
-    def _build_judge_prompt(self, group_id: int, query: str, rubrics: list[dict[str, Any]], rollout_texts: list[str]) -> str:
+    def _build_judge_prompt(self, query: str, rubrics: list[dict[str, Any]], rollout_text: str) -> str:
         rubric_lines = []
         for i, item in enumerate(rubrics):
             title = str(item.get("title", "")).strip()
-            description = str(item.get("description", "")).strip()
+            rubric = str(item.get("rubric", item.get("description", ""))).strip()
             weight = item.get("weight", 1)
             rubric_lines.append(
                 f"{i + 1}. title: {title}\n"
-                f"   description: {description}\n"
+                f"   rubric: {rubric}\n"
                 f"   weight: {weight}"
             )
-
-        rollout_lines = []
-        for i, text in enumerate(rollout_texts):
-            rollout_lines.append(f"[{i}]\n{text}")
-
         rubric_block = "\n".join(rubric_lines) if rubric_lines else "No rubrics provided."
-        rollout_block = "\n\n".join(rollout_lines)
 
         return (
-            "You are evaluating multiple rollout answers for the same user query.\n\n"
-            f"Group ID: {group_id}\n\n"
-            "User query:\n"
+            "You are an expert scorer for deep-research quality.\n"
+            "For the query and response below, score ONLY this single response using the rubric.\n\n"
+            "Query:\n"
             f"{query}\n\n"
-            "Rubric items (weight indicates relative importance, not normalized coefficient):\n"
+            "Response:\n"
+            f"{rollout_text}\n\n"
+            "Rubric (title, rubric, weight):\n"
             f"{rubric_block}\n\n"
-            "Candidate rollouts:\n"
-            f"{rollout_block}\n\n"
-            "Task:\n"
-            "1) Compare all candidates using all rubric items.\n"
-            "2) Pay more attention to higher-weight rubric items.\n"
-            "3) Return a score for EACH candidate rollout.\n"
-            "4) Score range must be 0 to 10 (higher is better).\n"
-            "5) Also return winners as candidate indices that tie for best score.\n\n"
-            "Return only JSON with this schema:\n"
-            "{\n"
-            f'  "group_id": {group_id},\n'
-            '  "scores": [7.8, 6.2, 9.1, 5.4],\n'
-            '  "winners": [0],\n'
-            '  "reason": "short explanation"\n'
-            "}\n"
+            "Scoring rule:\n"
+            "- Return one final score in [0, 10], where 0 is worst and 10 is best.\n"
+            "- Do not output explanations.\n"
+            "- Output must be JSON only, with this schema:\n"
+            '{\n  "score": 7.5\n}\n'
         )

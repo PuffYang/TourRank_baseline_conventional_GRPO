@@ -423,12 +423,23 @@ class RayPPOTrainer:
         lines = []
         for i in range(n):
             entry = {k: v[i] for k, v in base_data.items()}
-            lines.append(json.dumps(entry, ensure_ascii=False))
+            lines.append(json.dumps(entry, ensure_ascii=False, default=self._json_safe_default))
 
         with open(filename, "w") as f:
             f.write("\n".join(lines) + "\n")
 
         print(f"Dumped generations to {filename}")
+
+    @staticmethod
+    def _json_safe_default(obj):
+        """Convert common numpy/torch scalar/array values into JSON-serializable python types."""
+        if isinstance(obj, (np.integer, np.floating, np.bool_)):
+            return obj.item()
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, torch.Tensor):
+            return obj.detach().cpu().tolist()
+        raise TypeError(f"Object of type {obj.__class__.__name__} is not JSON serializable")
 
     def _log_rollout_data(
         self, batch: DataProto, reward_extra_infos_dict: dict, timing_raw: dict, rollout_data_dir: str

@@ -67,7 +67,7 @@ sandbox_fusion:
   # Max memory limit for each sandbox process in MB
   memory_limit_mb: 1024
 
-# GPT rubric judge options for group-wise rollout ranking.
+# GPT rubric judge options for per-rollout scoring.
 gpt_judge:
   model: gpt-4o
   api_key: null
@@ -80,6 +80,7 @@ gpt_judge:
   retry_sleep: 1.5
   n_rollouts: ${actor_rollout_ref.rollout.n}
   strict_n_rollouts: False
+  score_normalization: fixed_range
   max_rollout_chars: 12000
   fallback_to_first_on_error: True
   win_score: 1.0
