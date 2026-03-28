@@ -240,7 +240,7 @@ class RubricGPTJudgeRewardManager(RewardManagerBase):
                         {"role": "user", "content": judge_prompt},
                     ],
                     temperature=self.temperature,
-                    max_tokens=self.max_tokens,
+                    max_completion_tokens=self.max_tokens,
                     timeout=self.timeout,
                 )
                 content = resp.choices[0].message.content or ""
