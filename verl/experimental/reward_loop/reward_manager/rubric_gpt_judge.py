@@ -15,10 +15,8 @@
 import json
 import logging
 import os
+import re
 import time
-from datetime import datetime, timezone
-from pathlib import Path
-from threading import Lock
 from typing import Any
 
 from openai import AzureOpenAI
@@ -77,14 +75,6 @@ class RubricGPTJudgeRewardManager(RewardManagerBase):
             azure_endpoint=azure_endpoint,
         )
 
-        rollout_save_dir = judge_cfg.get("rollout_save_dir")
-        self.rollout_save_path = None
-        self._io_lock = Lock()
-        if rollout_save_dir:
-            rollout_dir = Path(rollout_save_dir)
-            rollout_dir.mkdir(parents=True, exist_ok=True)
-            self.rollout_save_path = rollout_dir / f"gpt_judge_rollouts_worker_{os.getpid()}.jsonl"
-
         if self.strict_n_rollouts:
             logger.warning(
                 "strict_n_rollouts=True is ignored in single-rollout judge mode. "
@@ -94,87 +84,41 @@ class RubricGPTJudgeRewardManager(RewardManagerBase):
     async def run_single(self, data: DataProto) -> dict:
         """Score a single rollout with one GPT call."""
         assert len(data) == 1, "Only support single data item"
-        output = self._score_item(
-            data_item=data[0],
-            global_step=int(data.meta_info.get("global_steps", -1)),
-            group_id=0,
-            rollout_index=0,
-        )
+        output = self._score_item(data_item=data[0])
         return output
 
     async def run_batch(self, data: DataProto) -> list[dict]:
         """Score each rollout independently (one rollout per prompt to GPT)."""
         outputs: list[dict] = []
-        global_step = int(data.meta_info.get("global_steps", -1))
         for idx in range(len(data)):
-            output = self._score_item(
-                data_item=data[idx],
-                global_step=global_step,
-                group_id=idx,
-                rollout_index=0,
-            )
+            output = self._score_item(data_item=data[idx])
             outputs.append(output)
         return outputs
 
-    def _score_item(self, data_item: DataProto, global_step: int, group_id: int, rollout_index: int) -> dict:
+    def _score_item(self, data_item: DataProto) -> dict:
         query, rubrics = self._extract_query_and_rubrics(data_item)
         rollout_text = self._extract_response_text(data_item)
         judge_prompt = self._build_judge_prompt(query=query, rubrics=rubrics, rollout_text=rollout_text)
-        judge_raw_output = ""
 
         try:
-            judge_result, judge_raw_output = self._judge_rollout(judge_prompt=judge_prompt)
+            judge_result = self._judge_rollout(judge_prompt=judge_prompt)
             raw_score = self._extract_single_score(judge_result)
             normalized_score = self._normalize_single_score(raw_score)
-            reason = str(judge_result.get("reason", "")).strip()
         except Exception as exc:
             if not self.fallback_to_first_on_error:
                 raise
-            reason = f"fallback due to judge error: {exc}"
             raw_score = self.score_range_min
             normalized_score = self.lose_score
-            logger.warning("Judge failed for group=%s rollout=%s, fallback to lose_score. error=%s", group_id, rollout_index, exc)
-
-        uid = str(data_item.non_tensor_batch.get("uid", ""))
-        self._append_rollout_record(
-            {
-                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-                "global_step": global_step,
-                "uid": uid,
-                "group_id": group_id,
-                "rollout_index": rollout_index,
-                "expected_n_rollouts": self.n_rollouts,
-                "query": query,
-                "rubrics": rubrics,
-                "response": rollout_text,
-                "judge_prompt": judge_prompt,
-                "judge_raw_output": judge_raw_output,
-                "raw_score": float(raw_score),
-                "normalized_score": float(normalized_score),
-                "reason": reason,
-                "judge_model": self.model,
-            }
-        )
+            logger.warning("Judge failed, fallback to lose_score. error=%s", exc)
 
         return {
             "reward_score": float(normalized_score),
             "reward_extra_info": {
                 "acc": float(normalized_score),
-                "gpt_judge_score": float(normalized_score),
                 "gpt_judge_raw_score": float(raw_score),
                 "gpt_judge_normalized_score": float(normalized_score),
-                "gpt_judge_reason": reason,
-                "gpt_judge_group_id": group_id,
-                "gpt_judge_rollout_index": rollout_index,
             },
         }
-
-    def _append_rollout_record(self, record: dict[str, Any]) -> None:
-        if self.rollout_save_path is None:
-            return
-        with self._io_lock:
-            with self.rollout_save_path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     def _extract_query_and_rubrics(self, data_item: DataProto) -> tuple[str, list[dict[str, Any]]]:
         ground_truth = data_item.non_tensor_batch.get("reward_model", {}).get("ground_truth", {}) or {}
@@ -197,11 +141,88 @@ class RubricGPTJudgeRewardManager(RewardManagerBase):
         valid_response_length = int(data_item.batch["attention_mask"][-response_length:].sum().item())
         valid_response_ids = response_ids[:valid_response_length].tolist()
         response = self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
+        response = self._prepare_response_for_judge(response)
         if len(response) > self.max_rollout_chars:
             response = response[: self.max_rollout_chars]
         return response
 
-    def _judge_rollout(self, judge_prompt: str) -> tuple[dict[str, Any], str]:
+    @staticmethod
+    def _prepare_response_for_judge(text: str) -> str:
+        cleaned = RubricGPTJudgeRewardManager._strip_think_blocks(text)
+
+        # If model produced boxed final answer, prioritize it.
+        boxed_answers = re.findall(r"\\boxed\{(.*?)\}", cleaned, flags=re.DOTALL)
+        if boxed_answers:
+            return boxed_answers[-1].strip()
+
+        meta_prefixes = (
+            "decompose the query",
+            "assumptions",
+            "plan",
+            "search plan",
+            "goal",
+            "next step",
+            "sufficiency check",
+            "synthesis",
+            "proceed to final answer",
+            "latest snippets",
+            "first result",
+            "return the minimal boxed answer",
+            "we will provide the minimal direct answer",
+        )
+
+        filtered_lines: list[str] = []
+        for raw_line in cleaned.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            normalized = re.sub(r"^[>\-\*\d\.\)\(\s]+", "", line).strip().lower()
+            if not normalized:
+                continue
+
+            if normalized in {"assistant", "user"}:
+                continue
+
+            # Keep explicit final-answer labels, drop generic planning labels.
+            if normalized.startswith("final answer") or normalized.startswith("answer:"):
+                if ":" in line:
+                    tail = line.split(":", 1)[1].strip()
+                    if tail:
+                        filtered_lines.append(tail)
+                continue
+
+            if any(normalized.startswith(prefix) for prefix in meta_prefixes):
+                continue
+
+            filtered_lines.append(line)
+
+        if not filtered_lines:
+            return cleaned.strip()
+
+        # Prefer the last paragraph/line as the final user-facing answer.
+        joined = "\n".join(filtered_lines).strip()
+        paragraphs = [p.strip() for p in re.split(r"\n{2,}", joined) if p.strip()]
+        if paragraphs:
+            return paragraphs[-1]
+        return filtered_lines[-1].strip()
+
+    @staticmethod
+    def _strip_think_blocks(text: str) -> str:
+        cleaned = text
+        pattern = re.compile(r"<think>.*?</think>", flags=re.DOTALL | re.IGNORECASE)
+        # Repeatedly apply to handle multiple blocks robustly.
+        while True:
+            updated = pattern.sub("", cleaned)
+            if updated == cleaned:
+                break
+            cleaned = updated
+        # Remove possible orphan tags and normalize spacing.
+        cleaned = re.sub(r"</?think>", "", cleaned, flags=re.IGNORECASE)
+        cleaned = cleaned.strip()
+        return cleaned
+
+    def _judge_rollout(self, judge_prompt: str) -> dict[str, Any]:
         last_error = ""
 
         for attempt in range(1, self.max_retries + 1):
@@ -223,7 +244,7 @@ class RubricGPTJudgeRewardManager(RewardManagerBase):
                     timeout=self.timeout,
                 )
                 content = resp.choices[0].message.content or ""
-                return self._parse_judge_output(content), content
+                return self._parse_judge_output(content)
             except Exception as exc:
                 last_error = str(exc)
                 if attempt < self.max_retries:
@@ -305,6 +326,8 @@ class RubricGPTJudgeRewardManager(RewardManagerBase):
             "Rubric (title, description, weight):\n"
             f"{rubric_block}\n\n"
             "Scoring rule:\n"
+            "- The response may include planning/process meta-text (e.g., Decompose/Plan/Search plan/Assumptions). "
+            "Ignore such meta-text and score only the final user-facing answer content.\n"
             "- Return one final score in [0, 10], where 0 is worst and 10 is best.\n"
             "- Weight indicates relative importance among rubric items, not a normalized coefficient.\n"
             "- Do not output explanations.\n"

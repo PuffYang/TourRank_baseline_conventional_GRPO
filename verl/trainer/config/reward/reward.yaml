@@ -86,4 +86,3 @@ gpt_judge:
   fallback_to_first_on_error: True
   win_score: 1.0
   lose_score: 0.0
-  rollout_save_dir: null
