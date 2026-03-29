@@ -319,6 +319,8 @@ class RayPPOTrainer:
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
         self.checkpoint_manager = None
+        self._gpt_judge_total_rollouts = 0
+        self._gpt_judge_content_filter_refused_rollouts = 0
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
@@ -440,6 +442,64 @@ class RayPPOTrainer:
         if isinstance(obj, torch.Tensor):
             return obj.detach().cpu().tolist()
         raise TypeError(f"Object of type {obj.__class__.__name__} is not JSON serializable")
+
+    @staticmethod
+    def _to_1d_float_array(values: Any) -> np.ndarray:
+        if values is None:
+            return np.array([], dtype=np.float32)
+        if isinstance(values, torch.Tensor):
+            arr = values.detach().cpu().numpy()
+        else:
+            arr = np.asarray(values)
+        if arr.size == 0:
+            return np.array([], dtype=np.float32)
+        arr = arr.reshape(-1)
+        if arr.dtype == np.bool_:
+            return arr.astype(np.float32)
+        try:
+            return arr.astype(np.float32)
+        except Exception:
+            safe_values: list[float] = []
+            for item in arr.tolist():
+                try:
+                    safe_values.append(float(item))
+                except Exception:
+                    continue
+            return np.asarray(safe_values, dtype=np.float32)
+
+    def _log_gpt_judge_training_metrics(self, metrics: dict[str, Any], reward_extra_infos_dict: dict[str, Any]) -> None:
+        if not reward_extra_infos_dict:
+            return
+
+        format_penalty = self._to_1d_float_array(reward_extra_infos_dict.get("format_penalty"))
+        if format_penalty.size > 0:
+            metrics["training/format_penalty"] = float(np.mean(format_penalty))
+
+        normalized_score = self._to_1d_float_array(reward_extra_infos_dict.get("gpt_judge_normalized_score"))
+        if normalized_score.size > 0:
+            metrics["training/gpt_judge_normalized_score"] = float(np.mean(normalized_score))
+
+        final_reward = np.array([], dtype=np.float32)
+        for key in ("gpt_judge_final_reward", "final_reward", "reward"):
+            final_reward = self._to_1d_float_array(reward_extra_infos_dict.get(key))
+            if final_reward.size > 0:
+                break
+        if final_reward.size > 0:
+            final_reward_mean = float(np.mean(final_reward))
+            metrics["training/gpt_judge_final_reward"] = final_reward_mean
+            metrics["training/reward"] = final_reward_mean
+            metrics["training/gpt_judge_final_reward/reward"] = final_reward_mean
+
+        refused = self._to_1d_float_array(reward_extra_infos_dict.get("gpt_judge_content_filter_refused"))
+        if refused.size > 0:
+            refused_count = int(np.sum(refused > 0.5))
+            total_count = int(refused.size)
+            self._gpt_judge_content_filter_refused_rollouts += refused_count
+            self._gpt_judge_total_rollouts += total_count
+            metrics["training/gpt_judge_content_filter_refused_ratio"] = float(refused_count / max(1, total_count))
+            metrics["training/gpt_judge_content_filter_refused_ratio_overall"] = float(
+                self._gpt_judge_content_filter_refused_rollouts / max(1, self._gpt_judge_total_rollouts)
+            )
 
     def _log_rollout_data(
         self, batch: DataProto, reward_extra_infos_dict: dict, timing_raw: dict, rollout_data_dir: str
@@ -1456,6 +1516,7 @@ class RayPPOTrainer:
 
                         # extract reward_tensor and reward_extra_infos_dict for training
                         reward_tensor, reward_extra_infos_dict = extract_reward(batch)
+                        self._log_gpt_judge_training_metrics(metrics=metrics, reward_extra_infos_dict=reward_extra_infos_dict)
 
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
