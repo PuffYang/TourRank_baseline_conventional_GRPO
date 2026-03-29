@@ -46,6 +46,7 @@ class RubricGPTJudgeRewardManager(RewardManagerBase):
         self.retry_sleep = float(judge_cfg.get("retry_sleep", 1.5))
         self.n_rollouts = int(judge_cfg.get("n_rollouts", config.actor_rollout_ref.rollout.n))
         self.strict_n_rollouts = bool(judge_cfg.get("strict_n_rollouts", False))
+        self.enable_content_filter_retry = bool(judge_cfg.get("enable_content_filter_retry", True))
 
         self.max_rollout_chars = int(judge_cfg.get("max_rollout_chars", 12000))
         self.fallback_to_first_on_error = bool(judge_cfg.get("fallback_to_first_on_error", True))
@@ -97,11 +98,31 @@ class RubricGPTJudgeRewardManager(RewardManagerBase):
 
     def _score_item(self, data_item: DataProto) -> dict:
         query, rubrics = self._extract_query_and_rubrics(data_item)
-        rollout_text = self._extract_response_text(data_item)
+        rollout_text, format_penalty = self._extract_response_text(data_item)
         judge_prompt = self._build_judge_prompt(query=query, rubrics=rubrics, rollout_text=rollout_text)
+        fallback_judge_prompt = None
+        redacted_judge_prompt = None
+        if self.enable_content_filter_retry:
+            safe_query = self._sanitize_for_judge(query)
+            safe_rollout_text = self._sanitize_for_judge(rollout_text)
+            safe_rubrics = self._sanitize_rubrics_for_judge(rubrics)
+            fallback_judge_prompt = self._build_judge_prompt(
+                query=safe_query,
+                rubrics=safe_rubrics,
+                rollout_text=safe_rollout_text,
+            )
+            redacted_judge_prompt = self._build_judge_prompt(
+                query="[policy-redacted query]",
+                rubrics=safe_rubrics,
+                rollout_text="[policy-redacted response; evaluate conservatively based on safe visible content only]",
+            )
 
         try:
-            judge_result = self._judge_rollout(judge_prompt=judge_prompt)
+            judge_result = self._judge_rollout(
+                judge_prompt=judge_prompt,
+                fallback_judge_prompt=fallback_judge_prompt,
+                redacted_judge_prompt=redacted_judge_prompt,
+            )
             raw_score = self._extract_single_score(judge_result)
             normalized_score = self._normalize_single_score(raw_score)
         except Exception as exc:
@@ -111,12 +132,16 @@ class RubricGPTJudgeRewardManager(RewardManagerBase):
             normalized_score = self.lose_score
             logger.warning("Judge failed, fallback to lose_score. error=%s", exc)
 
+        final_reward = float(normalized_score + format_penalty)
         return {
-            "reward_score": float(normalized_score),
+            "reward_score": final_reward,
             "reward_extra_info": {
-                "acc": float(normalized_score),
+                "acc": final_reward,
                 "gpt_judge_raw_score": float(raw_score),
                 "gpt_judge_normalized_score": float(normalized_score),
+                "gpt_judge_format_penalty": float(format_penalty),
+                "gpt_judge_final_reward": final_reward,
+                "gpt_judge_scored_response": rollout_text,
             },
         }
 
@@ -135,20 +160,45 @@ class RubricGPTJudgeRewardManager(RewardManagerBase):
         valid_prompt_ids = prompt_ids[-valid_prompt_length:].tolist()
         return self.tokenizer.decode(valid_prompt_ids, skip_special_tokens=True)
 
-    def _extract_response_text(self, data_item: DataProto) -> str:
+    def _extract_response_text(self, data_item: DataProto) -> tuple[str, float]:
         response_ids = data_item.batch["responses"]
         response_length = response_ids.shape[-1]
         valid_response_length = int(data_item.batch["attention_mask"][-response_length:].sum().item())
         valid_response_ids = response_ids[:valid_response_length].tolist()
         response = self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
+        format_penalty = self._compute_answer_format_penalty(response)
         response = self._prepare_response_for_judge(response)
         if len(response) > self.max_rollout_chars:
             response = response[: self.max_rollout_chars]
-        return response
+        return response, format_penalty
+
+    @staticmethod
+    def _compute_answer_format_penalty(text: str) -> float:
+        """Penalty is 0 when final answer is wrapped by <answer>...</answer>, else -1."""
+        cleaned = RubricGPTJudgeRewardManager._strip_think_blocks(text or "")
+        pattern = re.compile(r"<\s*answer\s*>(.*?)<\s*/\s*answer\s*>", flags=re.DOTALL | re.IGNORECASE)
+        matches = list(pattern.finditer(cleaned))
+        if not matches:
+            return -1.0
+
+        last_match = matches[-1]
+        trailing_text = cleaned[last_match.end() :].strip()
+        inner_answer = re.sub(r"</?[^>]+>", "", last_match.group(1)).strip()
+        if inner_answer and not trailing_text:
+            return 0.0
+        return -1.0
 
     @staticmethod
     def _prepare_response_for_judge(text: str) -> str:
         cleaned = RubricGPTJudgeRewardManager._strip_think_blocks(text)
+
+        # If model produced explicit final answer blocks, prioritize them.
+        answer_blocks = re.findall(r"<\s*answer\s*>(.*?)<\s*/\s*answer\s*>", cleaned, flags=re.DOTALL | re.IGNORECASE)
+        if answer_blocks:
+            answer = answer_blocks[-1].strip()
+            answer = re.sub(r"</?[^>]+>", "", answer).strip()
+            if answer:
+                return answer
 
         # If model produced boxed final answer, prioritize it.
         boxed_answers = re.findall(r"\\boxed\{(.*?)\}", cleaned, flags=re.DOTALL)
@@ -184,6 +234,9 @@ class RubricGPTJudgeRewardManager(RewardManagerBase):
             if normalized in {"assistant", "user"}:
                 continue
 
+            if normalized in {"<answer>", "</answer>", "<final_answer>", "</final_answer>"}:
+                continue
+
             # Keep explicit final-answer labels, drop generic planning labels.
             if normalized.startswith("final answer") or normalized.startswith("answer:"):
                 if ":" in line:
@@ -198,10 +251,12 @@ class RubricGPTJudgeRewardManager(RewardManagerBase):
             filtered_lines.append(line)
 
         if not filtered_lines:
-            return cleaned.strip()
+            fallback = re.sub(r"</?[^>]+>", "", cleaned).strip()
+            return fallback
 
         # Prefer the last paragraph/line as the final user-facing answer.
         joined = "\n".join(filtered_lines).strip()
+        joined = re.sub(r"</?[^>]+>", "", joined).strip()
         paragraphs = [p.strip() for p in re.split(r"\n{2,}", joined) if p.strip()]
         if paragraphs:
             return paragraphs[-1]
@@ -222,11 +277,73 @@ class RubricGPTJudgeRewardManager(RewardManagerBase):
         cleaned = cleaned.strip()
         return cleaned
 
-    def _judge_rollout(self, judge_prompt: str) -> dict[str, Any]:
+    @staticmethod
+    def _sanitize_for_judge(text: str) -> str:
+        """Reduce policy-triggering phrasing while keeping judging signal."""
+        if not text:
+            return text
+
+        cleaned = text
+        cleaned = re.sub(r"https?://\S+", "[url]", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\b(kill|killed|killing|kills)\b", "[violent_term]", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\b(murder|murdered|murdering)\b", "[violent_term]", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\b(attack|attacked|attacking|attacks)\b", "[violent_term]", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\b(shoot|shooting|shot|shooter)\b", "[violent_term]", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\b(stab|stabbed|stabbing)\b", "[violent_term]", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\b(bomb|bombed|bombing)\b", "[violent_term]", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\b(terror|terrorist|terrorism)\b", "[sensitive_term]", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\b(rape|raped|raping)\b", "[sensitive_term]", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\b(suicide|self-harm)\b", "[sensitive_term]", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\b(violent|violence)\b", "[sensitive_term]", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"(杀|谋杀|袭击|枪击|枪杀|刺伤|炸弹|爆炸|恐怖|恐袭|自杀|强奸|暴力|血腥)", "[sensitive_term]", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        if not cleaned:
+            return "[empty after policy sanitization]"
+        return cleaned
+
+    @staticmethod
+    def _sanitize_rubrics_for_judge(rubrics: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        safe_rubrics: list[dict[str, Any]] = []
+        for item in rubrics:
+            if not isinstance(item, dict):
+                continue
+            safe_rubrics.append(
+                {
+                    "title": RubricGPTJudgeRewardManager._sanitize_for_judge(str(item.get("title", ""))),
+                    "description": RubricGPTJudgeRewardManager._sanitize_for_judge(
+                        str(item.get("description", item.get("rubric", "")))
+                    ),
+                    "weight": item.get("weight", 1),
+                }
+            )
+        return safe_rubrics
+
+    @staticmethod
+    def _is_content_filter_error(exc: Exception) -> bool:
+        text = str(exc).lower()
+        return (
+            "content_filter" in text
+            or "responsibleaipolicyviolation" in text
+            or "content management policy" in text
+        )
+
+    def _judge_rollout(
+        self,
+        judge_prompt: str,
+        fallback_judge_prompt: str | None = None,
+        redacted_judge_prompt: str | None = None,
+    ) -> dict[str, Any]:
         last_error = ""
+        prompt_candidates: list[str] = [judge_prompt]
+        if fallback_judge_prompt:
+            prompt_candidates.append(fallback_judge_prompt)
+        if redacted_judge_prompt:
+            prompt_candidates.append(redacted_judge_prompt)
+        prompt_index = 0
 
         for attempt in range(1, self.max_retries + 1):
             try:
+                prompt = prompt_candidates[prompt_index]
                 resp = self.client.chat.completions.create(
                     model=self.model,
                     messages=[
@@ -237,7 +354,7 @@ class RubricGPTJudgeRewardManager(RewardManagerBase):
                                 "Return only valid JSON without markdown."
                             ),
                         },
-                        {"role": "user", "content": judge_prompt},
+                        {"role": "user", "content": prompt},
                     ],
                     temperature=self.temperature,
                     max_completion_tokens=self.max_tokens,
@@ -247,6 +364,14 @@ class RubricGPTJudgeRewardManager(RewardManagerBase):
                 return self._parse_judge_output(content)
             except Exception as exc:
                 last_error = str(exc)
+                if self._is_content_filter_error(exc) and prompt_index < len(prompt_candidates) - 1:
+                    prompt_index += 1
+                    logger.warning(
+                        "Judge prompt hit content filter; switch to safer prompt stage %d/%d.",
+                        prompt_index + 1,
+                        len(prompt_candidates),
+                    )
+                    continue
                 if attempt < self.max_retries:
                     time.sleep(self.retry_sleep * attempt)
 
@@ -318,7 +443,7 @@ class RubricGPTJudgeRewardManager(RewardManagerBase):
 
         return (
             "You are an expert scorer for deep-research quality.\n"
-            "For the query and response below, score ONLY this single response using the rubric.\n\n"
+            "Using the provided rubric, score the response to the query below.\n\n"
             "Query:\n"
             f"{query}\n\n"
             "Response:\n"
@@ -326,8 +451,6 @@ class RubricGPTJudgeRewardManager(RewardManagerBase):
             "Rubric (title, description, weight):\n"
             f"{rubric_block}\n\n"
             "Scoring rule:\n"
-            "- The response may include planning/process meta-text (e.g., Decompose/Plan/Search plan/Assumptions). "
-            "Ignore such meta-text and score only the final user-facing answer content.\n"
             "- Return one final score in [0, 10], where 0 is worst and 10 is best.\n"
             "- Weight indicates relative importance among rubric items, not a normalized coefficient.\n"
             "- Do not output explanations.\n"
