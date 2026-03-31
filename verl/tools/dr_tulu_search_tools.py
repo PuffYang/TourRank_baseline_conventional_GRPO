@@ -53,9 +53,255 @@ class _DrTuluBaseTool(BaseTool):
             return value.strip()
         return str(value).strip()
 
+    def _get_runway_url(self) -> str:
+        return self._clean_text(
+            self.config.get(
+                "url",
+                os.getenv(
+                    "RUNWAY_WEB_SEARCH_API_URL",
+                    "https://runway.devops.xiaohongshu.com/openai/zhipu/paas/v4/web_search",
+                ),
+            )
+        )
+
+    def _get_runway_api_key(self) -> str:
+        api_key_env = self._clean_text(self.config.get("api_key_env")) or "RUNWAY_WEB_SEARCH_API_KEY"
+        return _require_env_var(api_key_env)
+
+    @staticmethod
+    def _get_nested_value(payload: Any, path: tuple[str, ...]) -> Any:
+        current = payload
+        for key in path:
+            if not isinstance(current, dict):
+                return None
+            current = current.get(key)
+        return current
+
+    @classmethod
+    def _first_text_value(cls, payload: Any, paths: list[tuple[str, ...]]) -> str:
+        for path in paths:
+            value = cls._get_nested_value(payload, path)
+            text = cls._clean_text(value)
+            if text:
+                return text
+        return ""
+
+    @classmethod
+    def _find_list_of_dicts(cls, payload: Any) -> list[dict[str, Any]]:
+        if isinstance(payload, list):
+            dict_items = [item for item in payload if isinstance(item, dict)]
+            if dict_items:
+                return dict_items
+            for item in payload:
+                found = cls._find_list_of_dicts(item)
+                if found:
+                    return found
+            return []
+
+        if isinstance(payload, dict):
+            preferred_keys = [
+                "organic",
+                "results",
+                "items",
+                "data",
+                "documents",
+                "docs",
+                "value",
+                "pages",
+            ]
+            for key in preferred_keys:
+                value = payload.get(key)
+                if isinstance(value, list) and any(isinstance(item, dict) for item in value):
+                    return [item for item in value if isinstance(item, dict)]
+                found = cls._find_list_of_dicts(value)
+                if found:
+                    return found
+            for value in payload.values():
+                found = cls._find_list_of_dicts(value)
+                if found:
+                    return found
+        return []
+
+    @classmethod
+    def _extract_result_records(cls, payload: Any) -> list[dict[str, Any]]:
+        records = cls._find_list_of_dicts(payload)
+        if records:
+            return records
+        if isinstance(payload, dict):
+            likely_record = {
+                "title": cls._first_text_value(payload, [("title",), ("name",)]),
+                "url": cls._first_text_value(payload, [("url",), ("link",), ("href",)]),
+                "snippet": cls._first_text_value(
+                    payload,
+                    [
+                        ("snippet",),
+                        ("description",),
+                        ("summary",),
+                        ("text",),
+                        ("content",),
+                        ("body",),
+                    ],
+                ),
+            }
+            if any(likely_record.values()):
+                return [likely_record]
+        return []
+
+    @classmethod
+    def _extract_webpage_payload(cls, payload: Any, fallback_url: str) -> dict[str, str]:
+        title = cls._first_text_value(
+            payload,
+            [
+                ("title",),
+                ("data", "title"),
+                ("metadata", "title"),
+                ("result", "title"),
+            ],
+        )
+        page_url = cls._first_text_value(
+            payload,
+            [
+                ("url",),
+                ("data", "url"),
+                ("metadata", "url"),
+                ("result", "url"),
+            ],
+        ) or fallback_url
+        content = cls._first_text_value(
+            payload,
+            [
+                ("content",),
+                ("text",),
+                ("markdown",),
+                ("body",),
+                ("result",),
+                ("data", "content"),
+                ("data", "text"),
+                ("data", "markdown"),
+                ("data", "body"),
+                ("data", "result"),
+            ],
+        )
+
+        if not content:
+            records = cls._extract_result_records(payload)
+            if records:
+                joined = []
+                for record in records[:3]:
+                    lines = []
+                    title_text = cls._clean_text(record.get("title") or record.get("name"))
+                    url_text = cls._clean_text(record.get("url") or record.get("link") or record.get("href"))
+                    content_text = cls._clean_text(
+                        record.get("content")
+                        or record.get("text")
+                        or record.get("snippet")
+                        or record.get("description")
+                        or record.get("summary")
+                    )
+                    if title_text:
+                        lines.append(f"Title: {title_text}")
+                    if url_text:
+                        lines.append(f"URL: {url_text}")
+                    if content_text:
+                        lines.append(f"Content: {content_text}")
+                    if lines:
+                        joined.append("\n".join(lines))
+                content = "\n\n".join(joined)
+
+        if not content:
+            content = cls._clean_text(payload)
+
+        return {
+            "url": page_url,
+            "title": title,
+            "content": content,
+        }
+
+    @classmethod
+    def _extract_runway_web_reader_payload(cls, payload: Any, fallback_url: str) -> dict[str, str]:
+        title = cls._first_text_value(
+            payload,
+            [
+                ("title",),
+                ("data", "title"),
+                ("metadata", "title"),
+            ],
+        )
+        page_url = cls._first_text_value(
+            payload,
+            [
+                ("url",),
+                ("data", "url"),
+                ("metadata", "url"),
+            ],
+        ) or fallback_url
+        content = cls._first_text_value(
+            payload,
+            [
+                ("content",),
+                ("text",),
+                ("markdown",),
+                ("result",),
+                ("data", "content"),
+                ("data", "text"),
+                ("data", "markdown"),
+                ("data", "result"),
+            ],
+        )
+
+        if not content:
+            content = cls._clean_text(payload)
+
+        return {
+            "url": page_url,
+            "title": title,
+            "content": content,
+        }
+
+    def _runway_request(self, payload: dict[str, Any]) -> Any:
+        response = requests.post(
+            self._get_runway_url(),
+            headers={
+                "api-key": self._get_runway_api_key(),
+                "Content-Type": "application/json",
+            },
+            data=json.dumps(payload),
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def _get_runway_search_engine(self, default: str) -> str:
+        return self._clean_text(self.config.get("search_engine")) or default
+
 
 class GoogleSearchTool(_DrTuluBaseTool):
     def get_openai_tool_schema(self) -> OpenAIFunctionToolSchema:
+        backend = self._clean_text(self.config.get("backend")).lower() or "serper"
+        properties = {
+            "query": OpenAIFunctionPropertySchema(
+                type="string",
+                description="The search query.",
+            ),
+        }
+        if backend != "runway":
+            properties.update(
+                {
+                    "gl": OpenAIFunctionPropertySchema(
+                        type="string",
+                        description="Geolocation country code, e.g. us.",
+                    ),
+                    "hl": OpenAIFunctionPropertySchema(
+                        type="string",
+                        description="Host language code, e.g. en.",
+                    ),
+                    "num_results": OpenAIFunctionPropertySchema(
+                        type="integer",
+                        description="Maximum number of results to return.",
+                    ),
+                }
+            )
+
         return OpenAIFunctionToolSchema(
             type="function",
             function=OpenAIFunctionSchema(
@@ -63,24 +309,7 @@ class GoogleSearchTool(_DrTuluBaseTool):
                 description="General web search for relevant webpages and snippets.",
                 parameters=OpenAIFunctionParametersSchema(
                     type="object",
-                    properties={
-                        "query": OpenAIFunctionPropertySchema(
-                            type="string",
-                            description="The search query.",
-                        ),
-                        "gl": OpenAIFunctionPropertySchema(
-                            type="string",
-                            description="Geolocation country code, e.g. us.",
-                        ),
-                        "hl": OpenAIFunctionPropertySchema(
-                            type="string",
-                            description="Host language code, e.g. en.",
-                        ),
-                        "num_results": OpenAIFunctionPropertySchema(
-                            type="integer",
-                            description="Maximum number of results to return.",
-                        ),
-                    },
+                    properties=properties,
                     required=["query"],
                 ),
             ),
@@ -91,7 +320,24 @@ class GoogleSearchTool(_DrTuluBaseTool):
         if not query:
             return ToolResponse(text="Error: query is required."), 0.0, {"status": "error"}
 
+        backend = self._clean_text(self.config.get("backend")).lower() or "serper"
+
         def _search():
+            if backend == "runway":
+                search_engine = self._get_runway_search_engine("search_prime")
+                if search_engine != "search_prime":
+                    raise ValueError(
+                        f"google_search with runway backend must use search_engine='search_prime', got '{search_engine}'"
+                    )
+                payload = self._runway_request(
+                    {
+                        "search_engine": search_engine,
+                        "search_query": query,
+                        "query_rewrite": str(self.config.get("query_rewrite", "false")).lower(),
+                    }
+                )
+                return payload
+
             response = requests.post(
                 "https://google.serper.dev/search",
                 headers={
@@ -114,17 +360,26 @@ class GoogleSearchTool(_DrTuluBaseTool):
 
         try:
             payload = await asyncio.to_thread(_search)
-            organic_results = payload.get("organic", []) or []
+            organic_results = self._extract_result_records(payload)
             blocks = []
             for result in organic_results:
                 result_id = self._next_result_id(instance_id, "snippet")
                 lines = [
-                    f"Title: {self._clean_text(result.get('title'))}",
-                    f"URL: {self._clean_text(result.get('link'))}",
-                    f"Search Snippet: {self._clean_text(result.get('snippet'))}",
+                    f"Title: {self._clean_text(result.get('title') or result.get('name'))}",
+                    f"URL: {self._clean_text(result.get('link') or result.get('url') or result.get('href'))}",
+                    (
+                        "Search Snippet: "
+                        f"{self._clean_text(result.get('snippet') or result.get('description') or result.get('summary') or result.get('text') or result.get('content'))}"
+                    ),
                 ]
-                if result.get("date"):
-                    lines.append(f"Date: {self._clean_text(result.get('date'))}")
+                result_date = self._clean_text(
+                    result.get("date")
+                    or result.get("publishedDate")
+                    or result.get("time")
+                    or result.get("publish_time")
+                )
+                if result_date:
+                    lines.append(f"Date: {result_date}")
                 blocks.append(f"<snippet id={result_id}>\n" + "\n".join(lines) + "\n</snippet>")
             if not blocks:
                 empty_id = self._next_result_id(instance_id, "snippet")
@@ -132,13 +387,51 @@ class GoogleSearchTool(_DrTuluBaseTool):
             return (
                 ToolResponse(text=self._wrap_tool_output(blocks)),
                 0.0,
-                {"status": "success", "total_results": len(organic_results), "query_count": 1},
+                {"status": "success", "total_results": len(organic_results), "query_count": 1, "backend": backend},
             )
         except Exception as e:
             return ToolResponse(text=f"Error performing google_search: {e}"), 0.0, {"status": "error", "error": str(e)}
 
 
 class SnippetSearchTool(_DrTuluBaseTool):
+    def _build_fallback_response(
+        self,
+        instance_id: str,
+        query: str,
+        reason: str,
+        parameters: dict[str, Any],
+    ) -> tuple[ToolResponse, float, dict]:
+        result_id = self._next_result_id(instance_id, "snippet")
+        fallback_message = self._clean_text(self.config.get("fallback_message")) or (
+            "Semantic Scholar API is unavailable in this environment. "
+            "This placeholder snippet is only for pipeline debugging and should not be treated as factual evidence. "
+            "Prefer google_search and browse_webpage for actual retrieval."
+        )
+        lines = [
+            "Title: Semantic Scholar placeholder (debug mode)",
+            "Paper ID: debug-placeholder",
+            f"Snippet: {fallback_message} Query: {query}",
+        ]
+        if parameters.get("year"):
+            lines.append(f"Requested Year Filter: {self._clean_text(parameters.get('year'))}")
+        if parameters.get("fieldsOfStudy"):
+            lines.append(f"Requested Fields Of Study: {self._clean_text(parameters.get('fieldsOfStudy'))}")
+        if parameters.get("venue"):
+            lines.append(f"Requested Venue: {self._clean_text(parameters.get('venue'))}")
+
+        metrics = {
+            "status": "success",
+            "total_results": 1,
+            "query_count": 1,
+            "fallback_used": True,
+            "fallback_reason": reason,
+        }
+        if parameters.get("fieldsOfStudy"):
+            metrics["fields_of_study_ignored"] = True
+
+        text = self._wrap_tool_output([f"<snippet id={result_id}>\n" + "\n".join(lines) + "\n</snippet>"])
+        return ToolResponse(text=text), 0.0, metrics
+
     def get_openai_tool_schema(self) -> OpenAIFunctionToolSchema:
         return OpenAIFunctionToolSchema(
             type="function",
@@ -179,6 +472,18 @@ class SnippetSearchTool(_DrTuluBaseTool):
         if not query:
             return ToolResponse(text="Error: query is required."), 0.0, {"status": "error"}
 
+        api_key = os.getenv("S2_API_KEY")
+        fallback_on_missing_api_key = bool(self.config.get("fallback_on_missing_api_key", True))
+        fallback_on_request_error = bool(self.config.get("fallback_on_request_error", True))
+
+        if not api_key and fallback_on_missing_api_key:
+            return self._build_fallback_response(
+                instance_id=instance_id,
+                query=query,
+                reason="missing_s2_api_key",
+                parameters=parameters,
+            )
+
         def _search():
             response = requests.get(
                 "https://api.semanticscholar.org/graph/v1/snippet/search",
@@ -188,7 +493,7 @@ class SnippetSearchTool(_DrTuluBaseTool):
                     **({"year": parameters["year"]} if parameters.get("year") else {}),
                     **({"venue": parameters["venue"]} if parameters.get("venue") else {}),
                 },
-                headers={"x-api-key": _require_env_var("S2_API_KEY")},
+                headers={"x-api-key": api_key} if api_key else None,
                 timeout=self.timeout,
             )
             response.raise_for_status()
@@ -222,6 +527,13 @@ class SnippetSearchTool(_DrTuluBaseTool):
                 metrics["fields_of_study_ignored"] = True
             return ToolResponse(text=self._wrap_tool_output(blocks)), 0.0, metrics
         except Exception as e:
+            if fallback_on_request_error:
+                return self._build_fallback_response(
+                    instance_id=instance_id,
+                    query=query,
+                    reason=f"request_error:{type(e).__name__}",
+                    parameters=parameters,
+                )
             return ToolResponse(text=f"Error performing snippet_search: {e}"), 0.0, {"status": "error", "error": str(e)}
 
 
@@ -250,9 +562,23 @@ class BrowseWebpageTool(_DrTuluBaseTool):
         if not url:
             return ToolResponse(text="Error: url is required."), 0.0, {"status": "error"}
 
-        backend = str(self.config.get("backend", "jina")).lower()
+        backend = self._clean_text(self.config.get("backend")).lower() or "jina"
 
         def _browse():
+            if backend == "runway":
+                search_engine = self._get_runway_search_engine("web-reader")
+                if search_engine != "web-reader":
+                    raise ValueError(
+                        f"browse_webpage with runway backend must use search_engine='web-reader', got '{search_engine}'"
+                    )
+                payload = self._runway_request(
+                    {
+                        "search_engine": search_engine,
+                        "url": url,
+                    }
+                )
+                return self._extract_runway_web_reader_payload(payload, fallback_url=url)
+
             if backend == "serper":
                 response = requests.post(
                     "https://scrape.serper.dev",

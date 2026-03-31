@@ -3,19 +3,27 @@ tools:
     config:
       type: native
       timeout: 30
-      num_results: 5
-      gl: us
-      hl: en
+      backend: runway
+      url: https://runway.devops.xiaohongshu.com/openai/zhipu/paas/v4/web_search
+      api_key_env: RUNWAY_WEB_SEARCH_API_KEY
+      search_engine: search_prime
+      query_rewrite: "false"
 
   - class_name: verl.tools.dr_tulu_search_tools.SnippetSearchTool
     config:
       type: native
       timeout: 30
       limit: 5
+      fallback_on_missing_api_key: true
+      fallback_on_request_error: true
+      fallback_message: Semantic Scholar API is unavailable, so this placeholder snippet is returned only for debugging the training pipeline.
 
   - class_name: verl.tools.dr_tulu_search_tools.BrowseWebpageTool
     config:
       type: native
       timeout: 30
-      backend: jina
+      backend: runway
+      url: https://runway.devops.xiaohongshu.com/openai/zhipu/paas/v4/web_search
+      api_key_env: RUNWAY_WEB_SEARCH_API_KEY
+      search_engine: web-reader
       include_markdown: true
