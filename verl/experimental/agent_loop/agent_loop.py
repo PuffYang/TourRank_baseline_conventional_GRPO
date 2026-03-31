@@ -270,6 +270,7 @@ class AgentLoopBase(ABC):
         self.dataset_cls = dataset_cls
         self.data_config = data_config.config
         self.apply_chat_template_kwargs = self.data_config.get("apply_chat_template_kwargs", {})
+        self.use_tool_schema_in_chat_template = self.data_config.get("use_tool_schema_in_chat_template", True)
         self.system_prompt = initialize_system_prompt(self.tokenizer, **self.apply_chat_template_kwargs)
         self.loop = get_event_loop()
 
@@ -314,6 +315,9 @@ class AgentLoopBase(ABC):
         Returns:
             list[int]: Prompt token ids.
         """
+        if not self.use_tool_schema_in_chat_template:
+            tools = None
+
         if self.processor is not None:
             raw_prompt = await self.loop.run_in_executor(
                 None,
@@ -528,6 +532,8 @@ class AgentLoopWorker:
         # by default, we assume it's a single turn agent
         if "agent_name" not in batch.non_tensor_batch:
             default_agent_loop = config.agent.default_agent_loop
+            if default_agent_loop == "single_turn_agent" and config.multi_turn.enable:
+                default_agent_loop = "tool_agent"
             batch.non_tensor_batch["agent_name"] = np.array([default_agent_loop] * len(batch), dtype=object)
 
         if "index" in batch.non_tensor_batch:

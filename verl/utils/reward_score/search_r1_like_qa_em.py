@@ -18,6 +18,7 @@
 import random
 import re
 import string
+from typing import Optional
 
 
 def normalize_answer(s):
@@ -93,7 +94,58 @@ def count_answer_tags(text):
     return opening_tags, closing_tags
 
 
-def compute_score(solution_str, ground_truth, method="strict", format_score=0.0, score=1.0):
+def extract_search_tool_calls(context: str, mcp_parser_name: Optional[str] = None) -> list[str]:
+    if not mcp_parser_name:
+        patterns = [
+            r"<search>(.*?)</search>",
+            r"<call_tool name=(.*?)>(.*?)</call_tool>",
+            r"<tool name=(.*?)>(.*?)</tool>",
+        ]
+        extracted_queries = []
+        for pattern in patterns:
+            matches = re.findall(pattern, context, re.DOTALL)
+            if not matches:
+                continue
+            if isinstance(matches[0], tuple):
+                extracted_queries.extend(match[1].strip() for match in matches if match[1].strip())
+            else:
+                extracted_queries.extend(match.strip() for match in matches if match.strip())
+        return extracted_queries
+
+    if mcp_parser_name in {"unified"}:
+        matches = re.findall(r"<tool name=(.*?)>(.*?)</tool>", context, re.DOTALL)
+    elif mcp_parser_name in {"v20250824", "dr_tulu_xml"}:
+        matches = re.findall(r"<call_tool name=(.*?)>(.*?)</call_tool>", context, re.DOTALL)
+        if not matches:
+            matches = re.findall(r"<call_tool name=(.*?)>(.*?)</call>", context, re.DOTALL)
+    else:
+        return []
+
+    return [match[1].strip() for match in matches if match[1].strip()]
+
+
+def compute_format_reward(
+    response: str, mcp_parser_name: Optional[str] = None, use_full_response_as_answer: bool = False
+) -> float:
+    if use_full_response_as_answer:
+        return 1.0
+
+    answer_match = re.search(r"<answer>.*?</answer>", response, re.DOTALL)
+    answer_format_reward = 1.0 if answer_match else 0.0
+
+    citation_match = re.search(r"<cite id=[\"\']?[^\"\'>\s]+[\"\']?[^>]*>[^<]+</cite>", response, re.DOTALL)
+    citation_format_reward = 1.0 if citation_match else 0.0
+
+    queries = extract_search_tool_calls(response, mcp_parser_name=mcp_parser_name)
+    query_format_reward = 1.0 if queries else 0.0
+
+    return 0.5 * answer_format_reward + 0.3 * citation_format_reward + 0.2 * query_format_reward
+
+
+FORMAT_REWARD_WEIGHT = 0.2
+
+
+def compute_score_em(solution_str, ground_truth, method="strict", format_score=0.0, score=1.0):
     """The scoring function for exact match (EM).
 
     Args:
@@ -154,3 +206,28 @@ def compute_score_subem(solution_str, ground_truth, method="strict", format_scor
             return score
         else:
             return format_score
+
+
+def compute_score(solution_str, ground_truth, method="strict", format_score=0.0, score=1.0, extra_info=None, **kwargs):
+    extra_info = extra_info or {}
+    mcp_parser_name = extra_info.get("mcp_parser_name")
+    if mcp_parser_name is None and "<call_tool name=" in solution_str:
+        mcp_parser_name = "dr_tulu_xml"
+
+    format_reward = compute_format_reward(solution_str, mcp_parser_name=mcp_parser_name)
+    weighted_format_reward = FORMAT_REWARD_WEIGHT * format_reward
+    answer = extract_solution(solution_str=solution_str)
+    is_correct = answer is not None and subem_check(answer, ground_truth["target"])
+    reward_score = compute_score_subem(
+        solution_str=solution_str,
+        ground_truth=ground_truth,
+        format_score=weighted_format_reward,
+        method=method,
+        score=score,
+    )
+    return {
+        "score": reward_score,
+        "format_reward": format_reward,
+        "weighted_format_reward": weighted_format_reward,
+        "accuracy_reward": float(is_correct),
+    }

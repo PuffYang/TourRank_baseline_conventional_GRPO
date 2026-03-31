@@ -21,6 +21,7 @@ import re
 import traceback
 from collections import defaultdict
 from io import BytesIO
+from pathlib import Path
 from typing import Optional
 
 import datasets
@@ -114,6 +115,9 @@ class RLHFDataset(Dataset):
         self.truncation = config.get("truncation", "error")
         self.filter_overlong_prompts = config.get("filter_overlong_prompts", True)
         self.apply_chat_template_kwargs = config.get("apply_chat_template_kwargs", {})
+        self.system_prompt_file = config.get("system_prompt_file", None)
+        self.system_prompt_text = self._load_system_prompt_text(self.system_prompt_file)
+        self.use_tool_schema_in_chat_template = config.get("use_tool_schema_in_chat_template", True)
 
         self.tool_config_path = config.get("tool_config_path", None)
         self.tool_schemas = None
@@ -151,6 +155,40 @@ class RLHFDataset(Dataset):
         for i, parquet_file in enumerate(data_files):
             self.data_files[i] = copy_to_local(src=parquet_file, cache_dir=self.cache_dir, use_shm=self.use_shm)
 
+    def _load_system_prompt_text(self, system_prompt_file: Optional[str]) -> Optional[str]:
+        if not system_prompt_file:
+            return None
+
+        prompt_path = self._resolve_config_path(system_prompt_file)
+        return prompt_path.read_text(encoding="utf-8").strip()
+
+    def _resolve_config_path(self, path_str: str) -> Path:
+        path = Path(os.path.expanduser(path_str))
+        if path.is_absolute():
+            if not path.exists():
+                raise FileNotFoundError(f"system_prompt_file does not exist: {path}")
+            return path
+
+        repo_root = Path(__file__).resolve().parents[3]
+        candidates = [
+            (Path.cwd() / path).resolve(),
+            (repo_root / path).resolve(),
+            (repo_root.parent / path).resolve(),
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+
+        tried = ", ".join(str(candidate) for candidate in candidates)
+        raise FileNotFoundError(f"system_prompt_file does not exist: {path_str}. Tried: {tried}")
+
+    def _override_system_prompt(self, messages: list[dict]) -> list[dict]:
+        if self.system_prompt_text is None:
+            return messages
+
+        non_system_messages = [message for message in messages if message.get("role") != "system"]
+        return [{"role": "system", "content": self.system_prompt_text}, *non_system_messages]
+
     def _read_files_and_tokenize(self):
         dataframes = []
         for parquet_file in self.data_files:
@@ -184,7 +222,6 @@ class RLHFDataset(Dataset):
         if self.filter_overlong_prompts:
             tokenizer = self.tokenizer
             processor = self.processor
-            prompt_key = self.prompt_key
             image_key = self.image_key
             video_key = self.video_key
 
@@ -196,7 +233,7 @@ class RLHFDataset(Dataset):
                         messages = self._build_messages(doc)
                         # pass tool schemas if available so the processor can format prompts
                         apply_kwargs = dict(**self.apply_chat_template_kwargs)
-                        if self.tool_schemas is not None:
+                        if self.tool_schemas is not None and self.use_tool_schema_in_chat_template:
                             apply_kwargs["tools"] = self.tool_schemas
 
                         raw_prompt = self.processor.apply_chat_template(
@@ -251,8 +288,9 @@ class RLHFDataset(Dataset):
 
                 def doc2len(doc) -> int:
                     try:
+                        messages = self._build_messages(doc)
                         apply_kwargs = dict(**self.apply_chat_template_kwargs)
-                        if self.tool_schemas is not None:
+                        if self.tool_schemas is not None and self.use_tool_schema_in_chat_template:
                             apply_kwargs["tools"] = self.tool_schemas
 
                         # Keep explicit tokenization to avoid transformers version default changes.
@@ -261,7 +299,7 @@ class RLHFDataset(Dataset):
                         apply_kwargs.pop("return_tensors", None)
 
                         tokenized_prompt = tokenizer.apply_chat_template(
-                            doc[prompt_key], add_generation_prompt=True, tokenize=True, **apply_kwargs
+                            messages, add_generation_prompt=True, tokenize=True, **apply_kwargs
                         )
                         return len(normalize_token_ids(tokenized_prompt))
                     except Exception:
@@ -312,10 +350,11 @@ class RLHFDataset(Dataset):
         Returns:
             messages: List of messages with replaced placeholder.
         """
-        messages: list = example[self.prompt_key]
-        # When concatenating image and video datasets, pop will return None for image or video sample
-        images = example.pop(self.image_key, None) or []
-        videos = example.pop(self.video_key, None) or []
+        messages: list = copy.deepcopy(example[self.prompt_key])
+        messages = self._override_system_prompt(messages)
+        # When concatenating image and video datasets, one modality may be missing on a given sample.
+        images = example.get(self.image_key, None) or []
+        videos = example.get(self.video_key, None) or []
 
         image_offset, video_offset = 0, 0
         for message in messages:

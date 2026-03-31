@@ -1,0 +1,21 @@
+tools:
+  - class_name: verl.tools.dr_tulu_search_tools.GoogleSearchTool
+    config:
+      type: native
+      timeout: 30
+      num_results: 5
+      gl: us
+      hl: en
+
+  - class_name: verl.tools.dr_tulu_search_tools.SnippetSearchTool
+    config:
+      type: native
+      timeout: 30
+      limit: 5
+
+  - class_name: verl.tools.dr_tulu_search_tools.BrowseWebpageTool
+    config:
+      type: native
+      timeout: 30
+      backend: jina
+      include_markdown: true

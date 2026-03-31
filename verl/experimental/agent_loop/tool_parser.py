@@ -339,3 +339,61 @@ class Qwen3XMLToolParser(ToolParser):
         except Exception as e:
             logger.exception(f"Error in extracting tool call from response: {e}")
             return text, []
+
+
+@ToolParser.register("dr_tulu_xml")
+class DrTuluXMLToolParser(ToolParser):
+    """Parser for DR-Tulu style XML tool calls, e.g.
+    <call_tool name="google_search" gl="us">query</call_tool>
+    """
+
+    def __init__(self, tokenizer) -> None:
+        super().__init__(tokenizer)
+        self.tool_call_regex = regex.compile(
+            r"<call_tool\s+name=\"([^\"]+)\"([^>]*)>(.*?)</call_tool>",
+            regex.DOTALL,
+        )
+        self.attribute_regex = regex.compile(r'([A-Za-z_][A-Za-z0-9_]*)=\"([^\"]*)\"')
+
+    @staticmethod
+    def _infer_primary_arg_name(tool_name: str, tools: Optional[list[OpenAIFunctionToolSchema]]) -> str:
+        if tools:
+            for tool in tools:
+                if tool.function.name != tool_name:
+                    continue
+                properties = tool.function.parameters.properties
+                for candidate in ("query", "url", "webpage_url"):
+                    if candidate in properties:
+                        return candidate
+                required = tool.function.parameters.required or []
+                if required:
+                    return required[0]
+                if properties:
+                    return next(iter(properties.keys()))
+        if tool_name == "browse_webpage":
+            return "url"
+        return "query"
+
+    @rollout_trace_op
+    async def extract_tool_calls(
+        self, responses_ids: list[int], tools: list[OpenAIFunctionToolSchema] = None
+    ) -> tuple[str, list[FunctionCall]]:
+        loop = get_event_loop()
+        text = await loop.run_in_executor(None, self.tokenizer.decode, responses_ids)
+        matches = list(self.tool_call_regex.finditer(text))
+        if not matches:
+            return text, []
+
+        function_calls = []
+        for match in matches:
+            tool_name = match.group(1).strip()
+            attr_string = match.group(2) or ""
+            content = match.group(3).strip()
+            arguments = {key: value for key, value in self.attribute_regex.findall(attr_string)}
+            primary_arg_name = self._infer_primary_arg_name(tool_name, tools)
+            if content:
+                arguments[primary_arg_name] = content
+            function_calls.append(FunctionCall(name=tool_name, arguments=json.dumps(arguments, ensure_ascii=False)))
+
+        content = self.tool_call_regex.sub("", text)
+        return content, function_calls

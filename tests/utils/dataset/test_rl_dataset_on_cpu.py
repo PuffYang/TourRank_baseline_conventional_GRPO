@@ -195,3 +195,85 @@ def test_video_rl_data(video_data_file):
     assert "images" not in data_proto.non_tensor_batch
 
     print("raw_prompt", data_proto.non_tensor_batch["raw_prompt"][0])
+
+
+class DummyChatTokenizer:
+    def apply_chat_template(self, messages, add_generation_prompt=True, tokenize=True, **kwargs):
+        total_len = 0
+        for message in messages:
+            content = message["content"]
+            if isinstance(content, str):
+                total_len += len(content)
+        if add_generation_prompt:
+            total_len += 1
+        return list(range(total_len))
+
+
+def test_rl_dataset_overrides_system_prompt(tmp_path):
+    data_file = tmp_path / "train.json"
+    prompt_file = tmp_path / "system_prompt.txt"
+    prompt_file.write_text("new system prompt", encoding="utf-8")
+    data_file.write_text(
+        json.dumps(
+            [
+                {
+                    "prompt": [
+                        {"role": "system", "content": "old system prompt"},
+                        {"role": "user", "content": "hello"},
+                    ],
+                    "data_source": "unit_test",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    config = OmegaConf.create(
+        {
+            "prompt_key": "prompt",
+            "filter_overlong_prompts": False,
+            "system_prompt_file": str(prompt_file),
+        }
+    )
+
+    dataset = RLHFDataset(data_files=str(data_file), tokenizer=None, config=config)
+    raw_prompt = dataset[0]["raw_prompt"]
+
+    assert raw_prompt == [
+        {"role": "system", "content": "new system prompt"},
+        {"role": "user", "content": "hello"},
+    ]
+
+
+def test_rl_dataset_filters_with_overridden_system_prompt(tmp_path):
+    data_file = tmp_path / "train.json"
+    prompt_file = tmp_path / "system_prompt.txt"
+    prompt_file.write_text("12345", encoding="utf-8")
+    data_file.write_text(
+        json.dumps(
+            [
+                {
+                    "prompt": [
+                        {"role": "system", "content": "old"},
+                        {"role": "user", "content": "a"},
+                    ],
+                    "data_source": "unit_test",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    config = OmegaConf.create(
+        {
+            "prompt_key": "prompt",
+            "max_prompt_length": 6,
+            "filter_overlong_prompts": True,
+            "filter_overlong_prompts_workers": 1,
+            "system_prompt_file": str(prompt_file),
+        }
+    )
+
+    dataset = RLHFDataset(data_files=str(data_file), tokenizer=DummyChatTokenizer(), config=config)
+
+    assert len(dataset) == 0
