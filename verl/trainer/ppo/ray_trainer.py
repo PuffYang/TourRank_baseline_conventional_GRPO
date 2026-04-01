@@ -20,6 +20,7 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import json
 import os
+import re
 import uuid
 from collections import defaultdict
 from copy import deepcopy
@@ -473,6 +474,14 @@ class RayPPOTrainer:
         if not reward_extra_infos_dict:
             return
 
+        format_reward = self._to_1d_float_array(reward_extra_infos_dict.get("format_reward"))
+        if format_reward.size > 0:
+            metrics["training/format_reward"] = float(np.mean(format_reward))
+
+        weighted_format_reward = self._to_1d_float_array(reward_extra_infos_dict.get("weighted_format_reward"))
+        if weighted_format_reward.size > 0:
+            metrics["training/weighted_format_reward"] = float(np.mean(weighted_format_reward))
+
         format_penalty = self._to_1d_float_array(reward_extra_infos_dict.get("format_penalty"))
         if format_penalty.size > 0:
             metrics["training/format_penalty"] = float(np.mean(format_penalty))
@@ -515,7 +524,7 @@ class RayPPOTrainer:
         """
         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
             inputs = self._render_rollout_inputs(batch)
-            outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
+            outputs = self._render_rollout_outputs(batch)
             scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
             sample_gts = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
 
@@ -534,6 +543,41 @@ class RayPPOTrainer:
                 reward_extra_infos_dict=reward_extra_infos_to_dump,
                 dump_path=rollout_data_dir,
             )
+
+    def _render_rollout_outputs(self, batch: DataProto) -> list[str]:
+        rendered_outputs: list[str] = []
+        for idx in range(len(batch)):
+            response_ids = batch.batch["responses"][idx]
+            response_length = response_ids.shape[-1]
+            response_attention_mask = batch.batch["attention_mask"][idx][-response_length:]
+            valid_response_ids = response_ids[response_attention_mask.bool()].tolist()
+            decoded = self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
+            rendered_outputs.append(self._format_rollout_output_text(decoded))
+        return rendered_outputs
+
+    @staticmethod
+    def _format_rollout_output_text(text: str) -> str:
+        formatted = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+        if not formatted:
+            return formatted
+
+        block_open_patterns = [
+            r"<think>",
+            r"<call_tool\b[^>]*>",
+            r"<tool_output\b[^>]*>",
+            r"<answer\b[^>]*>",
+        ]
+        for pattern in block_open_patterns:
+            formatted = re.sub(rf"\s*({pattern})", r"\n\n\1", formatted, flags=re.IGNORECASE)
+
+        formatted = re.sub(r"\s*(</answer>)", r"\n\1\n", formatted, flags=re.IGNORECASE)
+        formatted = re.sub(r"\s*(</tool_output>)", r"\n\1\n", formatted, flags=re.IGNORECASE)
+        formatted = re.sub(r"\s*(</think>)", r"\1\n", formatted, flags=re.IGNORECASE)
+        formatted = re.sub(r"\s*(</call_tool>)", r"\1\n", formatted, flags=re.IGNORECASE)
+
+        formatted = re.sub(r"\n{3,}", "\n\n", formatted)
+        formatted = "\n".join(line.rstrip() for line in formatted.splitlines())
+        return formatted.strip()
 
     def _render_rollout_inputs(self, batch: DataProto) -> list[str]:
         raw_prompts = batch.non_tensor_batch.get("raw_prompt")

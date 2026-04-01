@@ -29,6 +29,8 @@ from verl.experimental.reward_loop.reward_manager.base import RewardManagerBase
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
+FORMAT_REWARD_WEIGHT = 0.2
+
 
 @register("rubric_gpt_judge")
 class RubricGPTJudgeRewardManager(RewardManagerBase):
@@ -98,7 +100,10 @@ class RubricGPTJudgeRewardManager(RewardManagerBase):
 
     def _score_item(self, data_item: DataProto) -> dict:
         query, rubrics = self._extract_query_and_rubrics(data_item)
-        rollout_text, format_penalty = self._extract_response_text(data_item)
+        response, format_reward, weighted_format_reward = self._extract_response_text(data_item)
+        rollout_text = self._prepare_response_for_judge(response)
+        if len(rollout_text) > self.max_rollout_chars:
+            rollout_text = rollout_text[: self.max_rollout_chars]
         judge_prompt = self._build_judge_prompt(query=query, rubrics=rubrics, rollout_text=rollout_text)
         content_filter_refused = False
         fallback_judge_prompt = None
@@ -134,16 +139,21 @@ class RubricGPTJudgeRewardManager(RewardManagerBase):
             normalized_score = self.lose_score
             logger.warning("Judge failed, fallback to lose_score. error=%s", exc)
 
-        final_reward = float(normalized_score + format_penalty)
+        final_reward = float(normalized_score + weighted_format_reward)
         return {
             "reward_score": final_reward,
             "reward_extra_info": {
                 "acc": final_reward,
                 "gpt_judge_raw_score": float(raw_score),
                 "gpt_judge_normalized_score": float(normalized_score),
-                "format_penalty": float(format_penalty),
+                # Keep the legacy key for existing metric plumbing in verl.
+                "format_penalty": float(weighted_format_reward),
+                "format_reward": float(format_reward),
+                "weighted_format_reward": float(weighted_format_reward),
                 "final_reward": final_reward,
-                "gpt_judge_format_penalty": float(format_penalty),
+                "gpt_judge_format_penalty": float(weighted_format_reward),
+                "gpt_judge_format_reward": float(format_reward),
+                "gpt_judge_weighted_format_reward": float(weighted_format_reward),
                 "gpt_judge_final_reward": final_reward,
                 "gpt_judge_content_filter_refused": float(1.0 if content_filter_refused else 0.0),
                 "gpt_judge_scored_response": rollout_text,
@@ -165,33 +175,61 @@ class RubricGPTJudgeRewardManager(RewardManagerBase):
         valid_prompt_ids = prompt_ids[-valid_prompt_length:].tolist()
         return self.tokenizer.decode(valid_prompt_ids, skip_special_tokens=True)
 
-    def _extract_response_text(self, data_item: DataProto) -> tuple[str, float]:
+    def _extract_response_text(self, data_item: DataProto) -> tuple[str, float, float]:
         response_ids = data_item.batch["responses"]
         response_length = response_ids.shape[-1]
         valid_response_length = int(data_item.batch["attention_mask"][-response_length:].sum().item())
         valid_response_ids = response_ids[:valid_response_length].tolist()
         response = self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
-        format_penalty = self._compute_answer_format_penalty(response)
-        response = self._prepare_response_for_judge(response)
-        if len(response) > self.max_rollout_chars:
-            response = response[: self.max_rollout_chars]
-        return response, format_penalty
+        format_reward = self._compute_format_reward(response)
+        weighted_format_reward = FORMAT_REWARD_WEIGHT * format_reward
+        return response, format_reward, weighted_format_reward
 
     @staticmethod
-    def _compute_answer_format_penalty(text: str) -> float:
-        """Penalty is 0 when final answer is wrapped by <answer>...</answer>, else -1."""
-        cleaned = RubricGPTJudgeRewardManager._strip_think_blocks(text or "")
-        pattern = re.compile(r"<\s*answer\s*>(.*?)<\s*/\s*answer\s*>", flags=re.DOTALL | re.IGNORECASE)
-        matches = list(pattern.finditer(cleaned))
-        if not matches:
-            return -1.0
+    def _extract_search_tool_calls(context: str, mcp_parser_name: str | None = None) -> list[str]:
+        if not mcp_parser_name:
+            patterns = [
+                r"<search>(.*?)</search>",
+                r"<call_tool name=(.*?)>(.*?)</call_tool>",
+                r"<tool name=(.*?)>(.*?)</tool>",
+            ]
+            extracted_queries: list[str] = []
+            for pattern in patterns:
+                matches = re.findall(pattern, context, re.DOTALL)
+                if not matches:
+                    continue
+                if isinstance(matches[0], tuple):
+                    extracted_queries.extend(match[1].strip() for match in matches if match[1].strip())
+                else:
+                    extracted_queries.extend(match.strip() for match in matches if match.strip())
+            return extracted_queries
 
-        last_match = matches[-1]
-        trailing_text = cleaned[last_match.end() :].strip()
-        inner_answer = re.sub(r"</?[^>]+>", "", last_match.group(1)).strip()
-        if inner_answer and not trailing_text:
-            return 0.0
-        return -1.0
+        if mcp_parser_name == "unified":
+            matches = re.findall(r"<tool name=(.*?)>(.*?)</tool>", context, re.DOTALL)
+        elif mcp_parser_name in {"v20250824", "dr_tulu_xml"}:
+            matches = re.findall(r"<call_tool name=(.*?)>(.*?)</call_tool>", context, re.DOTALL)
+            if not matches:
+                matches = re.findall(r"<call_tool name=(.*?)>(.*?)</call>", context, re.DOTALL)
+        else:
+            return []
+
+        return [match[1].strip() for match in matches if match[1].strip()]
+
+    @classmethod
+    def _compute_format_reward(cls, text: str) -> float:
+        response = text or ""
+        mcp_parser_name = "dr_tulu_xml" if "<call_tool name=" in response else None
+
+        answer_match = re.search(r"<answer>.*?</answer>", response, re.DOTALL)
+        answer_format_reward = 1.0 if answer_match else 0.0
+
+        citation_match = re.search(r"<cite id=[\"\']?[^\"\'>\s]+[\"\']?[^>]*>[^<]+</cite>", response, re.DOTALL)
+        citation_format_reward = 1.0 if citation_match else 0.0
+
+        queries = cls._extract_search_tool_calls(response, mcp_parser_name=mcp_parser_name)
+        query_format_reward = 1.0 if queries else 0.0
+
+        return 0.5 * answer_format_reward + 0.3 * citation_format_reward + 0.2 * query_format_reward
 
     @staticmethod
     def _prepare_response_for_judge(text: str) -> str:
