@@ -408,9 +408,10 @@ class RayPPOTrainer:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
     def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
-        """Dump rollout/validation samples as JSONL."""
+        """Dump rollout/validation samples as JSONL and a human-readable text file."""
         os.makedirs(dump_path, exist_ok=True)
         filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
+        pretty_filename = os.path.join(dump_path, f"{self.global_steps}.pretty.txt")
 
         n = len(inputs)
         base_data = {
@@ -433,7 +434,59 @@ class RayPPOTrainer:
         with open(filename, "w") as f:
             f.write("\n".join(lines) + "\n")
 
+        self._dump_pretty_generations(pretty_filename, base_data, n)
+
         print(f"Dumped generations to {filename}")
+        print(f"Dumped pretty generations to {pretty_filename}")
+
+    def _dump_pretty_generations(self, filename: str, base_data: dict[str, list[Any]], n: int) -> None:
+        sections: list[str] = []
+        preferred_order = [
+            "step",
+            "score",
+            "input",
+            "output",
+            "gpt_judge_scored_response",
+            "gts",
+            "acc",
+            "gpt_judge_raw_score",
+            "gpt_judge_normalized_score",
+            "format_reward",
+            "weighted_format_reward",
+            "final_reward",
+        ]
+
+        for i in range(n):
+            entry = {k: v[i] for k, v in base_data.items()}
+            lines = [f"===== Sample {i} ====="]
+            handled_keys: set[str] = set()
+
+            for key in preferred_order:
+                if key not in entry:
+                    continue
+                lines.extend(self._format_pretty_field(key, entry[key]))
+                handled_keys.add(key)
+
+            for key, value in entry.items():
+                if key in handled_keys:
+                    continue
+                lines.extend(self._format_pretty_field(key, value))
+
+            sections.append("\n".join(lines).rstrip())
+
+        with open(filename, "w", encoding="utf-8") as f:
+            f.write("\n\n".join(sections) + "\n")
+
+    def _format_pretty_field(self, key: str, value: Any) -> list[str]:
+        header = f"[{key}]"
+        if isinstance(value, str):
+            text = value.rstrip()
+            if not text:
+                return [header, ""]
+            return [header, text, ""]
+
+        rendered = json.dumps(value, ensure_ascii=False, indent=2, default=self._json_safe_default)
+        return [header, rendered, ""]
 
     @staticmethod
     def _json_safe_default(obj):
