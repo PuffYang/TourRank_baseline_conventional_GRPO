@@ -61,6 +61,7 @@ from verl.trainer.ppo.utils import (
 )
 from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
+from verl.utils.chat_template import apply_chat_template
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
 from verl.utils.import_utils import load_class_from_fqn
@@ -321,6 +322,7 @@ class RayPPOTrainer:
         self.checkpoint_manager = None
         self._gpt_judge_total_rollouts = 0
         self._gpt_judge_content_filter_refused_rollouts = 0
+        self._dump_tool_schemas = None
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
@@ -512,7 +514,7 @@ class RayPPOTrainer:
             rollout_data_dir (str): Directory path to save the rollout data
         """
         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
-            inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
+            inputs = self._render_rollout_inputs(batch)
             outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
             scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
             sample_gts = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
@@ -532,6 +534,69 @@ class RayPPOTrainer:
                 reward_extra_infos_dict=reward_extra_infos_to_dump,
                 dump_path=rollout_data_dir,
             )
+
+    def _render_rollout_inputs(self, batch: DataProto) -> list[str]:
+        raw_prompts = batch.non_tensor_batch.get("raw_prompt")
+        if raw_prompts is None:
+            return [self._decode_prompt_ids_for_dump(batch, i) for i in range(len(batch))]
+
+        rendered_inputs: list[str] = []
+        for idx in range(len(batch)):
+            try:
+                messages = deepcopy(raw_prompts[idx].tolist() if hasattr(raw_prompts[idx], "tolist") else raw_prompts[idx])
+                rendered_inputs.append(self._render_single_rollout_input(messages))
+            except Exception:
+                rendered_inputs.append(self._decode_prompt_ids_for_dump(batch, idx))
+        return rendered_inputs
+
+    def _render_single_rollout_input(self, messages: list[dict]) -> str:
+        apply_kwargs = self.config.data.get("apply_chat_template_kwargs", {})
+        if apply_kwargs is None:
+            apply_kwargs = {}
+        elif OmegaConf.is_config(apply_kwargs):
+            apply_kwargs = OmegaConf.to_container(apply_kwargs, resolve=True)
+
+        processing_class = self.processor if self.processor is not None else self.tokenizer
+        return apply_chat_template(
+            processing_class,
+            messages,
+            tools=self._get_dump_tool_schemas(),
+            add_generation_prompt=True,
+            tokenize=False,
+            **apply_kwargs,
+        )
+
+    def _decode_prompt_ids_for_dump(self, batch: DataProto, idx: int) -> str:
+        prompt_ids = batch.batch["prompts"][idx]
+        prompt_length = prompt_ids.shape[-1]
+        prompt_attention_mask = batch.batch["attention_mask"][idx][:prompt_length]
+        valid_prompt_ids = prompt_ids[prompt_attention_mask.bool()].tolist()
+        return self.tokenizer.decode(valid_prompt_ids, skip_special_tokens=False)
+
+    def _get_dump_tool_schemas(self) -> Optional[list[dict]]:
+        if not self.config.data.get("use_tool_schema_in_chat_template", True):
+            return None
+        if self._dump_tool_schemas is not None:
+            return self._dump_tool_schemas
+
+        tool_config_path = self.config.data.get("tool_config_path")
+        if not tool_config_path:
+            tool_config_path = self.config.actor_rollout_ref.rollout.multi_turn.get("tool_config_path")
+        if not tool_config_path:
+            self._dump_tool_schemas = None
+            return None
+
+        try:
+            from verl.tools.utils.tool_registry import initialize_tools_from_config
+
+            tool_list = initialize_tools_from_config(tool_config_path)
+            self._dump_tool_schemas = [
+                tool.tool_schema.model_dump(exclude_unset=True, exclude_none=True) for tool in tool_list
+            ]
+        except Exception:
+            self._dump_tool_schemas = None
+
+        return self._dump_tool_schemas
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""

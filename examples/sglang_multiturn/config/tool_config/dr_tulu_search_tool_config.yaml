@@ -27,3 +27,8 @@ tools:
       api_key_env: RUNWAY_WEB_SEARCH_API_KEY
       search_engine: web-reader
       include_markdown: true
+
+  - class_name: verl.tools.dr_tulu_search_tools.DownloadFileTool
+    config:
+      type: native
+      timeout: 30

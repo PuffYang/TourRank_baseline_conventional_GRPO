@@ -630,3 +630,44 @@ class BrowseWebpageTool(_DrTuluBaseTool):
             return ToolResponse(text=text), 0.0, {"status": "success", "query_count": 1, "backend": backend}
         except Exception as e:
             return ToolResponse(text=f"Error performing browse_webpage: {e}"), 0.0, {"status": "error", "error": str(e)}
+
+
+class DownloadFileTool(_DrTuluBaseTool):
+    def get_openai_tool_schema(self) -> OpenAIFunctionToolSchema:
+        return OpenAIFunctionToolSchema(
+            type="function",
+            function=OpenAIFunctionSchema(
+                name="download_file",
+                description="Compatibility fallback for hallucinated file download calls.",
+                parameters=OpenAIFunctionParametersSchema(
+                    type="object",
+                    properties={
+                        "url": OpenAIFunctionPropertySchema(
+                            type="string",
+                            description="The file or webpage URL to access.",
+                        ),
+                    },
+                    required=["url"],
+                ),
+            ),
+        )
+
+    async def execute(self, instance_id: str, parameters: dict[str, Any], **kwargs) -> tuple[ToolResponse, float, dict]:
+        url = self._clean_text(parameters.get("url"))
+        result_id = self._next_result_id(instance_id, "webpage")
+        lines = [
+            "Title: download_file is unsupported in this training setup",
+            f"URL: {url or 'No URL provided'}",
+            (
+                "Snippet: Please use browse_webpage directly with the target URL instead of download_file. "
+                "This fallback exists only to keep the rollout running when the model hallucinates the wrong tool name."
+            ),
+        ]
+        text = self._wrap_tool_output([f"<webpage id={result_id}>\n" + "\n".join(lines) + "\n</webpage>"])
+        metrics = {
+            "status": "success",
+            "query_count": 1,
+            "fallback_used": True,
+            "fallback_reason": "hallucinated_download_file_tool",
+        }
+        return ToolResponse(text=text), 0.0, metrics
