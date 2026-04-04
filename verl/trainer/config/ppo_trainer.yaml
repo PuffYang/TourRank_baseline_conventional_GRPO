@@ -144,6 +144,48 @@ trainer:
   # Directory for logging validation data; no dump if null
   validation_data_dir: null
 
+  # Configuration for out-of-domain validation benchmarks run alongside val.parquet
+  ood_validation:
+
+    # Whether to enable the OOD validation pipeline
+    enable: True
+
+    # Whether to also run OOD validation during the optional validation-before-training step
+    run_on_initial_validation: False
+
+    # Local directory containing prepared OOD benchmark JSONL files
+    data_dir: /mnt/tidal-alsh-share2/usr/yangzixuan/TourRank/DR-Tulu/data/RL/preprocess/val
+
+    # Subdirectory name under each checkpoint step folder for OOD validation outputs
+    output_subdir: ood_validation
+
+    # Batch size for OOD validation generation
+    batch_size: 16
+
+    # Whether trainer should fail hard when one OOD evaluator errors
+    fail_on_error: False
+
+    # Prepared DeepResearch Bench validation file name
+    deep_research_bench_file: deepresearch_bench_val.jsonl
+
+    # Prepared SQA-CS-V2 validation file name
+    sqa_cs_v2_file: sqa_cs_v2_val.jsonl
+
+    # Prepared HealthBench validation file name
+    healthbench_file: healthbench_val.jsonl
+
+    # Prepared ResearchQA validation file name
+    researchqa_file: researchqa_val.jsonl
+
+    # Grader model used by the HealthBench official evaluator
+    healthbench_grader_model: "gpt-4.1-2025-04-14"
+
+    # Scorer model used by the SQA-CS-V2 official evaluator
+    sqa_scorer_model: "google/gemini-2.5-flash"
+
+    # Maximum concurrent scorer connections for SQA-CS-V2 evaluation
+    sqa_max_connections: 16
+
   # Number of nodes used in the training
   nnodes: 1
 

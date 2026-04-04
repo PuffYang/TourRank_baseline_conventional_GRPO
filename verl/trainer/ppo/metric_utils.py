@@ -217,10 +217,17 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         metrics["num_turns/mean"] = num_turns.mean()
 
     if "tool_call_counts" in batch.non_tensor_batch:
-        tool_call_counts = batch.non_tensor_batch["tool_call_counts"]
-        metrics["tool_call_counts/min"] = tool_call_counts.min()
-        metrics["tool_call_counts/max"] = tool_call_counts.max()
-        metrics["tool_call_counts/mean"] = tool_call_counts.mean()
+        tool_call_counts = np.asarray(batch.non_tensor_batch["tool_call_counts"], dtype=np.int32)
+        metrics["train/tool_call_counts"] = int(tool_call_counts.sum())
+
+    for key, metric_name in (
+        ("tool_call_count_google_search", "train/tool_calls/google_search"),
+        ("tool_call_count_browse_webpage", "train/tool_calls/browse_webpage"),
+        ("tool_call_count_snippet_search", "train/tool_calls/snippet_search"),
+    ):
+        if key in batch.non_tensor_batch:
+            values = np.asarray(batch.non_tensor_batch[key], dtype=np.int32)
+            metrics[metric_name] = int(values.sum())
 
     return metrics
 

@@ -137,4 +137,4 @@ use_tool_schema_in_chat_template: True
 # Optional system prompt file. When set, any existing system message in each prompt
 # is replaced before rollout tokenization and prompt-length filtering.
 # Set to null to disable this override.
-system_prompt_file: ../dr-tulu/agent/dr_agent/shared_prompts/unified_tool_calling_v20250906.txt
+system_prompt_file: verl/trainer/prompts/unified_tool_calling_v20250906.txt

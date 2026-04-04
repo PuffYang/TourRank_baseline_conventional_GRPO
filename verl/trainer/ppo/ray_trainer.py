@@ -51,6 +51,7 @@ from verl.trainer.ppo.metric_utils import (
     compute_variance_proxy_metrics,
     process_validation_metrics,
 )
+from verl.trainer.ppo.ood_eval import OODValidationRunner
 from verl.trainer.ppo.reward import extract_reward
 from verl.trainer.ppo.utils import (
     Role,
@@ -321,9 +322,8 @@ class RayPPOTrainer:
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
         self.checkpoint_manager = None
-        self._gpt_judge_total_rollouts = 0
-        self._gpt_judge_content_filter_refused_rollouts = 0
         self._dump_tool_schemas = None
+        self.ood_validation_runner = OODValidationRunner(self)
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
@@ -446,9 +446,7 @@ class RayPPOTrainer:
             "score",
             "input",
             "output",
-            "gpt_judge_scored_response",
             "gts",
-            "acc",
             "gpt_judge_raw_score",
             "gpt_judge_normalized_score",
             "format_reward",
@@ -527,6 +525,10 @@ class RayPPOTrainer:
         if not reward_extra_infos_dict:
             return
 
+        raw_score = self._to_1d_float_array(reward_extra_infos_dict.get("gpt_judge_raw_score"))
+        if raw_score.size > 0:
+            metrics["training/gpt_judge_raw_score"] = float(np.mean(raw_score))
+
         format_reward = self._to_1d_float_array(reward_extra_infos_dict.get("format_reward"))
         if format_reward.size > 0:
             metrics["training/format_reward"] = float(np.mean(format_reward))
@@ -535,35 +537,18 @@ class RayPPOTrainer:
         if weighted_format_reward.size > 0:
             metrics["training/weighted_format_reward"] = float(np.mean(weighted_format_reward))
 
-        format_penalty = self._to_1d_float_array(reward_extra_infos_dict.get("format_penalty"))
-        if format_penalty.size > 0:
-            metrics["training/format_penalty"] = float(np.mean(format_penalty))
-
         normalized_score = self._to_1d_float_array(reward_extra_infos_dict.get("gpt_judge_normalized_score"))
         if normalized_score.size > 0:
             metrics["training/gpt_judge_normalized_score"] = float(np.mean(normalized_score))
 
         final_reward = np.array([], dtype=np.float32)
-        for key in ("gpt_judge_final_reward", "final_reward", "reward"):
+        for key in ("final_reward", "reward"):
             final_reward = self._to_1d_float_array(reward_extra_infos_dict.get(key))
             if final_reward.size > 0:
                 break
         if final_reward.size > 0:
             final_reward_mean = float(np.mean(final_reward))
-            metrics["training/gpt_judge_final_reward"] = final_reward_mean
             metrics["training/reward"] = final_reward_mean
-            metrics["training/gpt_judge_final_reward/reward"] = final_reward_mean
-
-        refused = self._to_1d_float_array(reward_extra_infos_dict.get("gpt_judge_content_filter_refused"))
-        if refused.size > 0:
-            refused_count = int(np.sum(refused > 0.5))
-            total_count = int(refused.size)
-            self._gpt_judge_content_filter_refused_rollouts += refused_count
-            self._gpt_judge_total_rollouts += total_count
-            metrics["training/gpt_judge_content_filter_refused_ratio"] = float(refused_count / max(1, total_count))
-            metrics["training/gpt_judge_content_filter_refused_ratio_overall"] = float(
-                self._gpt_judge_content_filter_refused_rollouts / max(1, self._gpt_judge_total_rollouts)
-            )
 
     def _log_rollout_data(
         self, batch: DataProto, reward_extra_infos_dict: dict, timing_raw: dict, rollout_data_dir: str
@@ -765,6 +750,10 @@ class RayPPOTrainer:
         sample_scores = []
         sample_turns = []
         sample_uids = []
+        val_tool_call_counts = []
+        val_google_search_counts = []
+        val_browse_webpage_counts = []
+        val_snippet_search_counts = []
 
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
@@ -848,6 +837,20 @@ class RayPPOTrainer:
             # collect num_turns of each prompt
             if "__num_turns__" in test_batch.non_tensor_batch:
                 sample_turns.append(test_batch.non_tensor_batch["__num_turns__"])
+            if "tool_call_counts" in test_batch.non_tensor_batch:
+                val_tool_call_counts.append(np.asarray(test_batch.non_tensor_batch["tool_call_counts"], dtype=np.int32))
+            if "tool_call_count_google_search" in test_batch.non_tensor_batch:
+                val_google_search_counts.append(
+                    np.asarray(test_batch.non_tensor_batch["tool_call_count_google_search"], dtype=np.int32)
+                )
+            if "tool_call_count_browse_webpage" in test_batch.non_tensor_batch:
+                val_browse_webpage_counts.append(
+                    np.asarray(test_batch.non_tensor_batch["tool_call_count_browse_webpage"], dtype=np.int32)
+                )
+            if "tool_call_count_snippet_search" in test_batch.non_tensor_batch:
+                val_snippet_search_counts.append(
+                    np.asarray(test_batch.non_tensor_batch["tool_call_count_snippet_search"], dtype=np.int32)
+                )
 
             data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
 
@@ -874,18 +877,60 @@ class RayPPOTrainer:
                 "data_sources": data_source_lst,
                 "sample_uids": sample_uids,
                 "sample_turns": sample_turns,
+                "val_tool_call_counts": val_tool_call_counts,
+                "val_google_search_counts": val_google_search_counts,
+                "val_browse_webpage_counts": val_browse_webpage_counts,
+                "val_snippet_search_counts": val_snippet_search_counts,
                 "reward_extra_infos_dict": reward_extra_infos_dict,
             }
         data_sources = np.concatenate(data_source_lst, axis=0)
-        return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+        metric_dict = self._val_metrics_update(
+            data_sources,
+            sample_uids,
+            reward_extra_infos_dict,
+            sample_turns,
+            val_tool_call_counts=val_tool_call_counts,
+            val_google_search_counts=val_google_search_counts,
+            val_browse_webpage_counts=val_browse_webpage_counts,
+            val_snippet_search_counts=val_snippet_search_counts,
+        )
+        metric_dict.update(self.ood_validation_runner.run())
+        return metric_dict
 
-    def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns):
+    def _val_metrics_update(
+        self,
+        data_sources,
+        sample_uids,
+        reward_extra_infos_dict,
+        sample_turns,
+        val_tool_call_counts=None,
+        val_google_search_counts=None,
+        val_browse_webpage_counts=None,
+        val_snippet_search_counts=None,
+    ):
         data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
         metric_dict = {}
         for data_source, var2metric2val in data_src2var2metric2val.items():
-            core_var = "acc" if "acc" in var2metric2val else "reward"
+            if "final_reward" in var2metric2val:
+                core_var = "final_reward"
+            elif "reward" in var2metric2val:
+                core_var = "reward"
+            else:
+                core_var = next(iter(var2metric2val.keys()), "reward")
+
+            n_max_by_var = {
+                var_name: max([int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys()])
+                for var_name, metric2val in var2metric2val.items()
+                if metric2val
+            }
+
+            core_score_metric_name = f"mean@{n_max_by_var.get(core_var, 1)}"
+            core_score_metric_val = var2metric2val.get(core_var, {}).get(core_score_metric_name)
+            if isinstance(core_score_metric_val, (int, float)):
+                metric_dict[f"val-score/{data_source}/score"] = float(core_score_metric_val)
+
             for var_name, metric2val in var2metric2val.items():
-                n_max = max([int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys()])
+                n_max = n_max_by_var[var_name]
                 for metric_name, metric_val in metric2val.items():
                     if (
                         (var_name == core_var)
@@ -904,15 +949,42 @@ class RayPPOTrainer:
             metric_dict["val-aux/num_turns/max"] = sample_turns.max()
             metric_dict["val-aux/num_turns/mean"] = sample_turns.mean()
 
+        if val_tool_call_counts:
+            metric_dict["val/tool_call_counts"] = int(np.concatenate(val_tool_call_counts).sum())
+        if val_google_search_counts:
+            metric_dict["val/tool_calls/google_search"] = int(np.concatenate(val_google_search_counts).sum())
+        if val_browse_webpage_counts:
+            metric_dict["val/tool_calls/browse_webpage"] = int(np.concatenate(val_browse_webpage_counts).sum())
+        if val_snippet_search_counts:
+            metric_dict["val/tool_calls/snippet_search"] = int(np.concatenate(val_snippet_search_counts).sum())
+
         return metric_dict
 
     def _merge_validation_results(self, result_a, result_b):
         if result_a is None and result_b is None:
             return {}
         if result_a is None:
-            result_a = {"data_sources": [], "sample_uids": [], "sample_turns": [], "reward_extra_infos_dict": {}}
+            result_a = {
+                "data_sources": [],
+                "sample_uids": [],
+                "sample_turns": [],
+                "val_tool_call_counts": [],
+                "val_google_search_counts": [],
+                "val_browse_webpage_counts": [],
+                "val_snippet_search_counts": [],
+                "reward_extra_infos_dict": {},
+            }
         if result_b is None:
-            result_b = {"data_sources": [], "sample_uids": [], "sample_turns": [], "reward_extra_infos_dict": {}}
+            result_b = {
+                "data_sources": [],
+                "sample_uids": [],
+                "sample_turns": [],
+                "val_tool_call_counts": [],
+                "val_google_search_counts": [],
+                "val_browse_webpage_counts": [],
+                "val_snippet_search_counts": [],
+                "reward_extra_infos_dict": {},
+            }
 
         if not result_a.get("data_sources") and not result_b.get("data_sources"):
             return {}
@@ -920,6 +992,10 @@ class RayPPOTrainer:
         data_sources = np.concatenate(result_a["data_sources"] + result_b["data_sources"], axis=0)
         sample_uids = result_a["sample_uids"] + result_b["sample_uids"]
         sample_turns = result_a["sample_turns"] + result_b["sample_turns"]
+        val_tool_call_counts = result_a["val_tool_call_counts"] + result_b["val_tool_call_counts"]
+        val_google_search_counts = result_a["val_google_search_counts"] + result_b["val_google_search_counts"]
+        val_browse_webpage_counts = result_a["val_browse_webpage_counts"] + result_b["val_browse_webpage_counts"]
+        val_snippet_search_counts = result_a["val_snippet_search_counts"] + result_b["val_snippet_search_counts"]
 
         reward_extra_infos_dict = {}
         all_keys = set(result_a["reward_extra_infos_dict"].keys()) | set(result_b["reward_extra_infos_dict"].keys())
@@ -928,7 +1004,16 @@ class RayPPOTrainer:
             list_b = result_b["reward_extra_infos_dict"].get(key, [])
             reward_extra_infos_dict[key] = list_a + list_b
 
-        return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+        return self._val_metrics_update(
+            data_sources,
+            sample_uids,
+            reward_extra_infos_dict,
+            sample_turns,
+            val_tool_call_counts=val_tool_call_counts,
+            val_google_search_counts=val_google_search_counts,
+            val_browse_webpage_counts=val_browse_webpage_counts,
+            val_snippet_search_counts=val_snippet_search_counts,
+        )
 
     def init_workers(self):
         """Initialize distributed training workers using Ray backend.

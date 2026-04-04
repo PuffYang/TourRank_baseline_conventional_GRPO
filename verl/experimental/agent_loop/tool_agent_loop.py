@@ -89,7 +89,12 @@ class AgentData:
         self.routed_experts = None
 
         # Extra fields for dynamic addition, e.g., tool session data
-        self.extra_fields: dict[str, Any] = {}
+        self.extra_fields: dict[str, Any] = {
+            "tool_call_counts": 0,
+            "tool_call_count_google_search": 0,
+            "tool_call_count_browse_webpage": 0,
+            "tool_call_count_snippet_search": 0,
+        }
 
 
 @register("tool_agent")
@@ -288,6 +293,21 @@ class ToolAgentLoop(AgentLoopBase):
         for tool_call in agent_data.tool_calls[: self.max_parallel_calls]:
             tasks.append(self._call_tool(tool_call, agent_data.tools_kwargs, agent_data))
             tool_call_names.append(tool_call.name)
+
+        if tool_call_names:
+            agent_data.extra_fields["tool_call_counts"] = int(agent_data.extra_fields.get("tool_call_counts", 0)) + len(
+                tool_call_names
+            )
+            for tool_name in tool_call_names:
+                if tool_name == "google_search":
+                    key = "tool_call_count_google_search"
+                elif tool_name == "browse_webpage":
+                    key = "tool_call_count_browse_webpage"
+                elif tool_name == "snippet_search":
+                    key = "tool_call_count_snippet_search"
+                else:
+                    continue
+                agent_data.extra_fields[key] = int(agent_data.extra_fields.get(key, 0)) + 1
 
         with simple_timer("tool_calls", agent_data.metrics):
             responses = await asyncio.gather(*tasks)

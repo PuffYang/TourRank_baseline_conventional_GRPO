@@ -105,7 +105,6 @@ class RubricGPTJudgeRewardManager(RewardManagerBase):
         if len(rollout_text) > self.max_rollout_chars:
             rollout_text = rollout_text[: self.max_rollout_chars]
         judge_prompt = self._build_judge_prompt(query=query, rubrics=rubrics, rollout_text=rollout_text)
-        content_filter_refused = False
         fallback_judge_prompt = None
         redacted_judge_prompt = None
         if self.enable_content_filter_retry:
@@ -132,7 +131,6 @@ class RubricGPTJudgeRewardManager(RewardManagerBase):
             raw_score = self._extract_single_score(judge_result)
             normalized_score = self._normalize_single_score(raw_score)
         except Exception as exc:
-            content_filter_refused = self._is_content_filter_error(exc)
             if not self.fallback_to_first_on_error:
                 raise
             raw_score = self.score_range_min
@@ -143,20 +141,11 @@ class RubricGPTJudgeRewardManager(RewardManagerBase):
         return {
             "reward_score": final_reward,
             "reward_extra_info": {
-                "acc": final_reward,
                 "gpt_judge_raw_score": float(raw_score),
                 "gpt_judge_normalized_score": float(normalized_score),
-                # Keep the legacy key for existing metric plumbing in verl.
-                "format_penalty": float(weighted_format_reward),
                 "format_reward": float(format_reward),
                 "weighted_format_reward": float(weighted_format_reward),
                 "final_reward": final_reward,
-                "gpt_judge_format_penalty": float(weighted_format_reward),
-                "gpt_judge_format_reward": float(format_reward),
-                "gpt_judge_weighted_format_reward": float(weighted_format_reward),
-                "gpt_judge_final_reward": final_reward,
-                "gpt_judge_content_filter_refused": float(1.0 if content_filter_refused else 0.0),
-                "gpt_judge_scored_response": rollout_text,
             },
         }
 
