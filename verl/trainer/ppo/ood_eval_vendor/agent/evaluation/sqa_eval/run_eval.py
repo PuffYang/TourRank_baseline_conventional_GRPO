@@ -24,7 +24,7 @@ Usage:
 Environment Variables Required:
     AZURE_OPENAI_API_KEY: Azure GPT-4o API key
     AZURE_OPENAI_ENDPOINT: Azure GPT-4o endpoint
-    OPENAI_API_VERSION: Azure GPT-4o API version
+    AZURE_OPENAI_API_VERSION: Azure GPT-4o API version
     HF_TOKEN: Hugging Face token (can be dummy if data is local)
 
 Dependencies:
@@ -35,6 +35,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -239,7 +240,7 @@ DEFAULT_API_VERSION = {DEFAULT_AZURE_OPENAI_API_VERSION!r}
 DEFAULT_SQA_RUBRICS_DIR = {str(_resolve_local_sqa_rubrics_dir())!r}
 
 os.environ.setdefault("AZURE_OPENAI_ENDPOINT", DEFAULT_ENDPOINT)
-os.environ.setdefault("OPENAI_API_VERSION", DEFAULT_API_VERSION)
+os.environ.setdefault("AZURE_OPENAI_API_VERSION", DEFAULT_API_VERSION)
 if os.environ.get("AZURE_OPENAI_API_KEY") and not os.environ.get("OPENAI_API_KEY"):
     os.environ["OPENAI_API_KEY"] = os.environ["AZURE_OPENAI_API_KEY"]
 
@@ -278,7 +279,10 @@ try:
             kwargs.pop("organization", None)
             kwargs.pop("project", None)
             kwargs["api_key"] = os.environ.get("AZURE_OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY")
-            kwargs["api_version"] = os.environ.get("OPENAI_API_VERSION", DEFAULT_API_VERSION)
+            kwargs["api_version"] = os.environ.get(
+                "AZURE_OPENAI_API_VERSION",
+                os.environ.get("OPENAI_API_VERSION", DEFAULT_API_VERSION),
+            )
             kwargs["azure_endpoint"] = os.environ.get("AZURE_OPENAI_ENDPOINT", DEFAULT_ENDPOINT)
             super().__init__(*args, **kwargs)
 
@@ -288,7 +292,10 @@ try:
             kwargs.pop("organization", None)
             kwargs.pop("project", None)
             kwargs["api_key"] = os.environ.get("AZURE_OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY")
-            kwargs["api_version"] = os.environ.get("OPENAI_API_VERSION", DEFAULT_API_VERSION)
+            kwargs["api_version"] = os.environ.get(
+                "AZURE_OPENAI_API_VERSION",
+                os.environ.get("OPENAI_API_VERSION", DEFAULT_API_VERSION),
+            )
             kwargs["azure_endpoint"] = os.environ.get("AZURE_OPENAI_ENDPOINT", DEFAULT_ENDPOINT)
             super().__init__(*args, **kwargs)
 
@@ -340,6 +347,62 @@ def _check_uv_available() -> bool:
         return result.returncode == 0
     except FileNotFoundError:
         return False
+
+
+def _interpreter_has_sqa_dependencies(python_executable: str) -> bool:
+    try:
+        result = subprocess.run(
+            [
+                python_executable,
+                "-c",
+                "import astabench, inspect_ai, datasets; print('ok')",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def _find_python311_with_deps() -> str | None:
+    candidates: list[str] = []
+    preferred = os.environ.get("SQA_PYTHON")
+    if preferred:
+        candidates.append(preferred)
+
+    for name in ["python3.12", "python3.11", "python3"]:
+        resolved = shutil.which(name)
+        if resolved:
+            candidates.append(resolved)
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        normalized = os.path.realpath(candidate)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        try:
+            version = subprocess.run(
+                [
+                    normalized,
+                    "-c",
+                    "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            if version.returncode != 0:
+                continue
+            major_minor = tuple(int(part) for part in version.stdout.strip().split(".")[:2])
+            if major_minor < (3, 11):
+                continue
+            if _interpreter_has_sqa_dependencies(normalized):
+                return normalized
+        except Exception:
+            continue
+
+    return None
 
 
 def _collect_numeric_metrics(obj: Any, targets: set[str], found: Dict[str, float]) -> None:
@@ -471,16 +534,23 @@ def run_sqa_evaluation(
 
     # Determine execution method
     use_uv = False
+    execution_method = "direct"
     py_version = sys.version_info
 
     if py_version >= (3, 11) and check_dependencies():
         # Direct execution: Python >= 3.11 and deps installed
         cmd = [sys.executable, "-m", "inspect_ai._cli.main"] + inspect_args
-    elif _check_uv_available():
-        # Use uv run: manages Python version + deps automatically
-        use_uv = True
-        # Create a temporary pyproject.toml for uv
-        pyproject_content = """
+    else:
+        python311 = _find_python311_with_deps()
+        if python311 is not None:
+            execution_method = f"direct via {python311}"
+            cmd = [python311, "-m", "inspect_ai._cli.main"] + inspect_args
+        elif _check_uv_available():
+            # Use uv run: manages Python version + deps automatically
+            use_uv = True
+            execution_method = "uv run (auto-managed Python 3.11+)"
+            # Create a temporary pyproject.toml for uv
+            pyproject_content = """
 [project]
 name = "sqa-eval-runner"
 version = "0.1.0"
@@ -496,37 +566,38 @@ override-dependencies = [
     "openai==1.78.0",
 ]
 """
-        pyproject_path = os.path.join(solver_dir, "pyproject.toml")
-        with open(pyproject_path, "w") as f:
-            f.write(pyproject_content)
+            pyproject_path = os.path.join(solver_dir, "pyproject.toml")
+            with open(pyproject_path, "w") as f:
+                f.write(pyproject_content)
 
-        cmd = [
-            "uv", "run", "--python", "3.11",
-            "inspect",
-        ] + inspect_args
-    else:
-        print("ERROR: Cannot run SQA evaluation:")
-        print(f"  - Current Python: {py_version.major}.{py_version.minor} (need >= 3.11)")
-        print(f"  - astabench requires Python >= 3.11")
-        print()
-        print("Options:")
-        print("  1. Install uv: pip install uv")
-        print("  2. Use Python >= 3.11 with: pip install astabench==0.3.1 inspect_ai datasets")
-        print("  3. Create a conda env: conda create -n sqa_eval python=3.11 && conda activate sqa_eval && pip install astabench==0.3.1 inspect_ai datasets")
-        # Cleanup
-        try:
-            import shutil
-            shutil.rmtree(solver_dir)
-        except Exception:
-            pass
-        sys.exit(1)
+            cmd = [
+                "uv", "run", "--python", "3.11",
+                "inspect",
+            ] + inspect_args
+        else:
+            print("ERROR: Cannot run SQA evaluation:")
+            print(f"  - Current Python: {py_version.major}.{py_version.minor} (need >= 3.11)")
+            print(f"  - astabench requires Python >= 3.11")
+            print(f"  - No usable Python 3.11+ interpreter with astabench/inspect_ai/datasets was found")
+            print()
+            print("Options:")
+            print("  1. Set SQA_PYTHON to a Python 3.11+ interpreter that already has astabench, inspect_ai, datasets")
+            print("  2. Install uv: pip install uv")
+            print("  3. Use Python >= 3.11 with: pip install astabench==0.3.1 inspect_ai datasets")
+            print("  4. Create a conda env: conda create -n sqa_eval python=3.11 && conda activate sqa_eval && pip install astabench==0.3.1 inspect_ai datasets")
+            # Cleanup
+            try:
+                shutil.rmtree(solver_dir)
+            except Exception:
+                pass
+            sys.exit(1)
 
     print(f"\n=== Running SQA Evaluation ===")
     print(f"Input file: {input_file}")
     print(f"Split: {split}")
     print(f"Scorer model: {scorer_model}")
     print(f"Max connections: {max_connections}")
-    print(f"Method: {'uv run (auto-managed Python 3.11+)' if use_uv else 'direct'}")
+    print(f"Method: {execution_method}")
     print(f"Command: {' '.join(cmd)}")
     print()
 
@@ -535,7 +606,7 @@ override-dependencies = [
     if env.get("AZURE_OPENAI_API_KEY") and not env.get("OPENAI_API_KEY"):
         env["OPENAI_API_KEY"] = env["AZURE_OPENAI_API_KEY"]
     env.setdefault("AZURE_OPENAI_ENDPOINT", DEFAULT_AZURE_OPENAI_ENDPOINT)
-    env.setdefault("OPENAI_API_VERSION", DEFAULT_AZURE_OPENAI_API_VERSION)
+    env.setdefault("AZURE_OPENAI_API_VERSION", DEFAULT_AZURE_OPENAI_API_VERSION)
     env.setdefault("SQA_RUBRICS_DATA_DIR", str(_resolve_local_sqa_rubrics_dir()))
     env["PYTHONPATH"] = (
         solver_dir

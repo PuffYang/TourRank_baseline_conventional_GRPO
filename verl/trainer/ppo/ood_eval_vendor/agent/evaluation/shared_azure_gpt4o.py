@@ -36,7 +36,10 @@ def get_azure_openai_config() -> dict[str, str]:
 
     return {
         "api_key": api_key,
-        "api_version": os.environ.get("OPENAI_API_VERSION", DEFAULT_AZURE_OPENAI_API_VERSION),
+        "api_version": os.environ.get(
+            "AZURE_OPENAI_API_VERSION",
+            os.environ.get("OPENAI_API_VERSION", DEFAULT_AZURE_OPENAI_API_VERSION),
+        ),
         "azure_endpoint": os.environ.get("AZURE_OPENAI_ENDPOINT", DEFAULT_AZURE_OPENAI_ENDPOINT),
     }
 
@@ -63,7 +66,7 @@ def create_chat_completion(
         model=resolve_azure_gpt4o_model(model),
         messages=messages,
         temperature=temperature,
-        max_tokens=max_tokens,
+        max_completion_tokens=max_tokens,
         timeout=timeout,
     )
 
