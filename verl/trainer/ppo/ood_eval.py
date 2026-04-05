@@ -107,6 +107,44 @@ def _scan_json_metrics(root_dir: Path, targets: set[str]) -> dict[str, float]:
     return metrics
 
 
+def _sanitize_metric_key(key: str) -> str:
+    sanitized = []
+    for char in str(key):
+        if char.isalnum() or char in {"_", "-", "."}:
+            sanitized.append(char)
+        else:
+            sanitized.append("_")
+    return "".join(sanitized).strip("_")
+
+
+def _flatten_numeric_metrics(
+    obj: Any,
+    prefix: str = "",
+    skip_keys: set[str] | None = None,
+    out: dict[str, float] | None = None,
+) -> dict[str, float]:
+    if out is None:
+        out = {}
+    if skip_keys is None:
+        skip_keys = set()
+
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            if key in skip_keys:
+                continue
+            key_str = _sanitize_metric_key(str(key))
+            if not key_str:
+                continue
+            next_prefix = f"{prefix}_{key_str}" if prefix else key_str
+            if isinstance(value, (int, float)):
+                out[next_prefix] = float(value)
+            elif isinstance(value, dict):
+                _flatten_numeric_metrics(value, prefix=next_prefix, skip_keys=skip_keys, out=out)
+        return out
+
+    return out
+
+
 class OODValidationRunner:
     def __init__(self, trainer):
         self.trainer = trainer
@@ -154,7 +192,6 @@ class OODValidationRunner:
                 primary_score = self._primary_score(spec, summary)
                 if primary_score is not None:
                     metrics[f"val-ood/{spec.display_name}/score"] = float(primary_score)
-                    metrics[f"val-score/{spec.display_name}/score"] = float(primary_score)
 
                 for key, value in self._auxiliary_scores(spec, summary).items():
                     metrics[f"val-ood/{spec.display_name}/{key}"] = float(value)
@@ -491,31 +528,23 @@ class OODValidationRunner:
         return None
 
     def _auxiliary_scores(self, spec: OODBenchmarkSpec, summary: dict[str, Any]) -> dict[str, float]:
-        aux_metrics: dict[str, float] = {}
-
         if spec.eval_task == "deep_research_bench":
-            race_metrics = summary.get("race", {})
-            fact_metrics = summary.get("fact", {})
-            if isinstance(race_metrics, dict):
-                for key in ("comprehensiveness", "insight", "instruction_following", "readability"):
-                    val = race_metrics.get(key)
-                    if isinstance(val, (int, float)):
-                        aux_metrics[f"race_{key}"] = float(val)
-            if isinstance(fact_metrics, dict):
-                for key in ("valid_rate", "avg_citations_per_article", "avg_valid_citations_per_article"):
-                    val = fact_metrics.get(key)
-                    if isinstance(val, (int, float)):
-                        aux_metrics[f"fact_{key}"] = float(val)
-            return aux_metrics
+            aux_metrics = _flatten_numeric_metrics(
+                summary,
+                skip_keys={"score", "num_examples", "per_example_results", "metadata"},
+            )
+        else:
+            aux_metrics = _flatten_numeric_metrics(
+                summary.get("metrics", {}),
+                skip_keys={"score", "num_examples", "per_example_results", "metadata"},
+            )
 
-        if spec.eval_task == "sqa_cs_v2":
-            metrics = summary.get("metrics", {})
-            if isinstance(metrics, dict):
-                for key in ("ingredient_recall", "answer_precision", "citation_recall", "citation_precision"):
-                    val = metrics.get(key)
-                    if isinstance(val, (int, float)):
-                        aux_metrics[key] = float(val)
-            return aux_metrics
+        primary_score = self._primary_score(spec, summary)
+        if primary_score is not None:
+            for duplicate_key in ("race_overall_score", "global_avg", "coverage", "overall_score"):
+                duplicate_val = aux_metrics.get(duplicate_key)
+                if duplicate_val is not None and abs(duplicate_val - primary_score) < 1e-12:
+                    aux_metrics.pop(duplicate_key, None)
 
         return aux_metrics
 

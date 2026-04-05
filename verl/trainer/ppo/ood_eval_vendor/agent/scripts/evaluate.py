@@ -13,6 +13,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from collections import defaultdict
 
 AGENT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.append(str(AGENT_ROOT))
@@ -21,8 +22,9 @@ sys.path.append(str(AGENT_ROOT / "evaluation"))
 from samplers import common
 
 from evaluation.health_bench_eval.healthbench_eval import HealthBenchEval
-from evaluation.research_qa_eval.compute_coverage import compute_coverage
-from evaluation.research_qa_eval.researchqa_loader import download_researchqa_dataset
+from evaluation.research_qa_eval.compute_coverage import compute_coverage, compute_coverage_score
+from evaluation.research_qa_eval.researchqa_loader import download_researchqa_dataset, load_researchqa_data
+from evaluation.shared_azure_gpt4o import resolve_azure_gpt4o_model
 from evaluation.samplers.sampler.chat_completion_sampler import (
     OPENAI_SYSTEM_MESSAGE_API,
     ChatCompletionSampler,
@@ -61,6 +63,51 @@ def convert_to_evaluate_format(original_examples: list[dict]) -> list[dict]:
     return converted_examples
 
 
+def _aggregate_researchqa_metrics(
+    dataset_path: str,
+    rubric_results: dict[str, list[dict]],
+) -> dict[str, object]:
+    items = load_researchqa_data(dataset_path)
+    item_by_id = {item.id: item for item in items}
+
+    scored_coverages: dict[str, float] = {}
+    by_general_domain: dict[str, list[float]] = defaultdict(list)
+    by_subdomain: dict[str, list[float]] = defaultdict(list)
+    by_field: dict[str, list[float]] = defaultdict(list)
+
+    for item_id, judges in rubric_results.items():
+        if item_id not in item_by_id or not judges:
+            continue
+
+        coverage = float(compute_coverage_score(judges))
+        scored_coverages[item_id] = coverage
+
+        item = item_by_id[item_id]
+        by_general_domain[item.general_domain].append(coverage)
+        by_subdomain[item.subdomain].append(coverage)
+        by_field[item.field].append(coverage)
+
+    def _summarize(groups: dict[str, list[float]]) -> dict[str, dict[str, float]]:
+        summary: dict[str, dict[str, float]] = {}
+        for name, values in sorted(groups.items()):
+            if not values:
+                continue
+            summary[name] = {
+                "coverage": float(sum(values) / len(values)),
+                "count": float(len(values)),
+            }
+        return summary
+
+    metrics: dict[str, object] = {
+        "num_scored_examples": float(len(scored_coverages)),
+        "by_general_domain": _summarize(by_general_domain),
+        "by_subdomain": _summarize(by_subdomain),
+        "by_field": _summarize(by_field),
+    }
+
+    return metrics
+
+
 def save_evaluation_results(results_path: str, task_name: str, final_result, generation_data: list[dict]) -> None:
     results_data = {
         "task": task_name,
@@ -82,7 +129,7 @@ def evaluate_healthbench(file_path: str, save_path: str | None, grader_model: st
     converted_examples = convert_to_evaluate_format(original_examples)
 
     grader_sampler = ChatCompletionSampler(
-        model=grader_model,
+        model=resolve_azure_gpt4o_model(grader_model),
         system_message=OPENAI_SYSTEM_MESSAGE_API,
         max_tokens=1000,
         temperature=0,
@@ -122,9 +169,10 @@ def evaluate_researchqa(file_path: str, save_path: str | None, grader_model: str
         response_map=response_map,
         output_path=None,
         batch_size=10,
-        model=grader_model,
+        model=resolve_azure_gpt4o_model(grader_model),
     )
     coverage = sum(coverages) / len(coverages) if coverages else 0.0
+    aggregated_metrics = _aggregate_researchqa_metrics(data_path, results)
 
     results_data = {
         "task": "researchqa",
@@ -132,6 +180,7 @@ def evaluate_researchqa(file_path: str, save_path: str | None, grader_model: str
         "score": coverage,
         "metrics": {
             "coverage": coverage,
+            **aggregated_metrics,
         },
         "metadata": {},
         "num_examples": len(original_examples),
@@ -156,7 +205,7 @@ def main() -> None:
     parser.add_argument("--save_path", default=None, help="Path to save the evaluation results")
     parser.add_argument(
         "--grader-model",
-        default="gpt-4.1-2025-04-14",
+        default="gpt-4o",
         help="Model to use for grading",
     )
     args = parser.parse_args()
@@ -169,7 +218,7 @@ def main() -> None:
     if args.task == "healthbench":
         evaluate_healthbench(args.file_path, args.save_path, args.grader_model)
     else:
-        evaluate_researchqa(args.file_path, args.save_path, grader_model="gpt-4.1-mini-2025-04-14")
+        evaluate_researchqa(args.file_path, args.save_path, grader_model=args.grader_model)
 
 
 if __name__ == "__main__":

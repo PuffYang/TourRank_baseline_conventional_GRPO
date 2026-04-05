@@ -17,12 +17,14 @@ Usage:
 
     # With options
     python run_eval.py run --input_file <path/to/sqa_output.jsonl> \
-        --scorer_model "google/gemini-2.5-flash" \
+        --scorer_model "openai/gpt-4o" \
         --max_connections 16 \
         --split test
 
 Environment Variables Required:
-    GOOGLE_API_KEY: Google API key (for Gemini-based scoring)
+    AZURE_OPENAI_API_KEY: Azure GPT-4o API key
+    AZURE_OPENAI_ENDPOINT: Azure GPT-4o endpoint
+    OPENAI_API_VERSION: Azure GPT-4o API version
     HF_TOKEN: Hugging Face token (can be dummy if data is local)
 
 Dependencies:
@@ -40,8 +42,16 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 # Import DR Tulu format conversion from Varsha's script (single source of truth)
-sys.path.insert(0, str(Path(__file__).parent))
+FILE_DIR = Path(__file__).resolve().parent
+EVAL_ROOT = FILE_DIR.parent
+sys.path.insert(0, str(FILE_DIR))
+sys.path.insert(0, str(EVAL_ROOT))
 from convert_to_asta_format import parse_answer
+from shared_azure_gpt4o import (
+    DEFAULT_AZURE_OPENAI_API_VERSION,
+    DEFAULT_AZURE_OPENAI_ENDPOINT,
+    resolve_azure_gpt4o_model,
+)
 
 
 def convert_to_asta_format(input_file: str, output_file: str = None) -> str:
@@ -169,7 +179,7 @@ def _query_cache(question: str):
 def cache_solver(
     path: str = "{data_path}",
     split: str = "{split}",
-    model: str = "openai/gpt-4.1",
+    model: str = "openai/gpt-4o",
 ) -> Solver:
     _load_dataset(path, split)
 
@@ -193,6 +203,54 @@ def cache_solver(
     return solve
 '''
     return solver_code
+
+
+def _normalize_sqa_scorer_model(scorer_model: str) -> str:
+    resolved = resolve_azure_gpt4o_model(scorer_model)
+    return resolved if "/" in resolved else f"openai/{resolved}"
+
+
+def _build_openai_sitecustomize() -> str:
+    return f'''
+import os
+
+DEFAULT_ENDPOINT = {DEFAULT_AZURE_OPENAI_ENDPOINT!r}
+DEFAULT_API_VERSION = {DEFAULT_AZURE_OPENAI_API_VERSION!r}
+
+os.environ.setdefault("AZURE_OPENAI_ENDPOINT", DEFAULT_ENDPOINT)
+os.environ.setdefault("OPENAI_API_VERSION", DEFAULT_API_VERSION)
+if os.environ.get("AZURE_OPENAI_API_KEY") and not os.environ.get("OPENAI_API_KEY"):
+    os.environ["OPENAI_API_KEY"] = os.environ["AZURE_OPENAI_API_KEY"]
+
+try:
+    import openai
+    from openai import AsyncAzureOpenAI, AzureOpenAI
+
+    class _PatchedOpenAI(AzureOpenAI):
+        def __init__(self, *args, **kwargs):
+            kwargs.pop("base_url", None)
+            kwargs.pop("organization", None)
+            kwargs.pop("project", None)
+            kwargs["api_key"] = os.environ.get("AZURE_OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY")
+            kwargs["api_version"] = os.environ.get("OPENAI_API_VERSION", DEFAULT_API_VERSION)
+            kwargs["azure_endpoint"] = os.environ.get("AZURE_OPENAI_ENDPOINT", DEFAULT_ENDPOINT)
+            super().__init__(*args, **kwargs)
+
+    class _PatchedAsyncOpenAI(AsyncAzureOpenAI):
+        def __init__(self, *args, **kwargs):
+            kwargs.pop("base_url", None)
+            kwargs.pop("organization", None)
+            kwargs.pop("project", None)
+            kwargs["api_key"] = os.environ.get("AZURE_OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY")
+            kwargs["api_version"] = os.environ.get("OPENAI_API_VERSION", DEFAULT_API_VERSION)
+            kwargs["azure_endpoint"] = os.environ.get("AZURE_OPENAI_ENDPOINT", DEFAULT_ENDPOINT)
+            super().__init__(*args, **kwargs)
+
+    openai.OpenAI = _PatchedOpenAI
+    openai.AsyncOpenAI = _PatchedAsyncOpenAI
+except Exception as exc:
+    print(f"WARNING: Failed to patch OpenAI client to Azure GPT-4o: {{exc}}")
+'''
 
 
 def _build_inspect_cmd(
@@ -303,7 +361,7 @@ def _extract_metrics_from_text(text: str) -> Dict[str, float]:
 def run_sqa_evaluation(
     input_file: str,
     split: str = "test",
-    scorer_model: str = "google/gemini-2.5-flash",
+    scorer_model: str = "openai/gpt-4o",
     max_connections: int = 16,
     simplified_eval: bool = True,
     assess_jointly: bool = True,
@@ -331,10 +389,10 @@ def run_sqa_evaluation(
         with_search_tools: Whether to use search tools
         output_dir: Directory for evaluation output
     """
-    # Check environment variables
-    if not os.environ.get("GOOGLE_API_KEY"):
-        print("WARNING: GOOGLE_API_KEY not set. Required for Gemini-based scoring.")
-        print("Set it with: export GOOGLE_API_KEY='your_key_here'")
+    scorer_model = _normalize_sqa_scorer_model(scorer_model)
+
+    if not (os.environ.get("AZURE_OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY")):
+        print("WARNING: AZURE_OPENAI_API_KEY not set. Required for Azure GPT-4o scoring.")
 
     # Create temporary solver script
     solver_code = create_cached_solver_script(
@@ -346,6 +404,9 @@ def run_sqa_evaluation(
     solver_path = os.path.join(solver_dir, "cached_solver.py")
     with open(solver_path, "w") as f:
         f.write(solver_code)
+    sitecustomize_path = os.path.join(solver_dir, "sitecustomize.py")
+    with open(sitecustomize_path, "w") as f:
+        f.write(_build_openai_sitecustomize())
 
     # Build inspect eval arguments
     inspect_args = _build_inspect_cmd(
@@ -423,11 +484,17 @@ override-dependencies = [
     print(f"Command: {' '.join(cmd)}")
     print()
 
-    # Pass through environment variables, set dummy keys if needed
+    # Pass through environment variables and redirect OpenAI clients to Azure GPT-4o
     env = os.environ.copy()
-    # astabench entrypoint loading requires OPENAI_API_KEY even when not using OpenAI
-    if not env.get("OPENAI_API_KEY"):
-        env["OPENAI_API_KEY"] = "dummy-not-used"
+    if env.get("AZURE_OPENAI_API_KEY") and not env.get("OPENAI_API_KEY"):
+        env["OPENAI_API_KEY"] = env["AZURE_OPENAI_API_KEY"]
+    env.setdefault("AZURE_OPENAI_ENDPOINT", DEFAULT_AZURE_OPENAI_ENDPOINT)
+    env.setdefault("OPENAI_API_VERSION", DEFAULT_AZURE_OPENAI_API_VERSION)
+    env["PYTHONPATH"] = (
+        solver_dir
+        if not env.get("PYTHONPATH")
+        else f"{solver_dir}{os.pathsep}{env['PYTHONPATH']}"
+    )
     # HF_TOKEN is needed for downloading gated allenai/asta-bench dataset
     if not env.get("HF_TOKEN"):
         # Try to get token from huggingface-cli login cache
@@ -503,7 +570,7 @@ Examples:
 
   # With custom scorer model:
   python run_eval.py run --input_file eval_output/sqa.jsonl \\
-      --scorer_model "google/gemini-2.5-flash"
+      --scorer_model "openai/gpt-4o"
 """,
     )
 
@@ -545,8 +612,8 @@ Examples:
     eval_parser.add_argument(
         "--scorer_model",
         type=str,
-        default="google/gemini-2.5-flash",
-        help="Scorer model (default: google/gemini-2.5-flash)",
+        default="openai/gpt-4o",
+        help="Scorer model (default: openai/gpt-4o)",
     )
     eval_parser.add_argument(
         "--max_connections",
@@ -580,8 +647,8 @@ Examples:
     run_parser.add_argument(
         "--scorer_model",
         type=str,
-        default="google/gemini-2.5-flash",
-        help="Scorer model (default: google/gemini-2.5-flash)",
+        default="openai/gpt-4o",
+        help="Scorer model (default: openai/gpt-4o)",
     )
     run_parser.add_argument(
         "--max_connections",

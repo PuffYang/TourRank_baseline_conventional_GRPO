@@ -41,6 +41,31 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+def _apply_tool_call_stop_strings(
+    sampling_params: dict[str, Any], tool_parser: ToolParser, rollout_name: str
+) -> dict[str, Any]:
+    updated_sampling_params = dict(sampling_params)
+    stop_strings = tool_parser.get_stop_strings()
+    if not stop_strings:
+        return updated_sampling_params
+
+    existing_stop = updated_sampling_params.get("stop")
+    merged_stop_strings: list[str] = []
+    if isinstance(existing_stop, str):
+        merged_stop_strings.append(existing_stop)
+    elif existing_stop is not None:
+        merged_stop_strings.extend(list(existing_stop))
+
+    for stop_string in stop_strings:
+        if stop_string not in merged_stop_strings:
+            merged_stop_strings.append(stop_string)
+
+    updated_sampling_params["stop"] = merged_stop_strings
+    if tool_parser.should_include_stop_strings_in_output() and rollout_name in {"vllm", "trtllm"}:
+        updated_sampling_params["include_stop_str_in_output"] = True
+    return updated_sampling_params
+
+
 class AgentState(Enum):
     PENDING = "pending"
     GENERATING = "generating"
@@ -221,6 +246,7 @@ class ToolAgentLoop(AgentLoopBase):
     ) -> AgentState:
         """Handle the generating state: generate model response and check for tool calls."""
         add_messages: list[dict[str, Any]] = []
+        sampling_params = _apply_tool_call_stop_strings(sampling_params, self.tool_parser, self.rollout_config.name)
 
         with simple_timer("generate_sequences", agent_data.metrics):
             output: TokenOutput = await self.server_manager.generate(

@@ -15,6 +15,7 @@ import json
 
 import pytest
 
+from verl.experimental.agent_loop.tool_agent_loop import _apply_tool_call_stop_strings
 from verl.experimental.agent_loop.tool_parser import DrTuluXMLToolParser
 from verl.tools.schemas import (
     OpenAIFunctionParametersSchema,
@@ -76,3 +77,23 @@ async def test_dr_tulu_xml_tool_parser():
     )
     assert len(browse_calls) == 1
     assert json.loads(browse_calls[0].arguments) == {"url": "https://example.com/article"}
+
+
+def test_dr_tulu_xml_tool_parser_stop_strings():
+    parser = DrTuluXMLToolParser(DummyTokenizer())
+
+    assert parser.get_stop_strings() == ["</call_tool>"]
+    assert parser.should_include_stop_strings_in_output() is True
+
+
+def test_apply_tool_call_stop_strings_for_vllm():
+    parser = DrTuluXMLToolParser(DummyTokenizer())
+
+    sampling_params = _apply_tool_call_stop_strings(
+        {"temperature": 0.7, "stop": ["</answer>"]},
+        parser,
+        rollout_name="vllm",
+    )
+
+    assert sampling_params["stop"] == ["</answer>", "</call_tool>"]
+    assert sampling_params["include_stop_str_in_output"] is True

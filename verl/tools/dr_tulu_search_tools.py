@@ -87,40 +87,84 @@ class _DrTuluBaseTool(BaseTool):
         return ""
 
     @classmethod
-    def _find_list_of_dicts(cls, payload: Any) -> list[dict[str, Any]]:
+    def _score_result_record(cls, record: dict[str, Any]) -> int:
+        score = 0
+        if cls._clean_text(record.get("title") or record.get("name")):
+            score += 3
+        if cls._clean_text(record.get("url") or record.get("link") or record.get("href")):
+            score += 3
+        if cls._clean_text(
+            record.get("snippet")
+            or record.get("description")
+            or record.get("summary")
+            or record.get("text")
+            or record.get("content")
+            or record.get("body")
+        ):
+            score += 2
+        if cls._clean_text(
+            record.get("date")
+            or record.get("publishedDate")
+            or record.get("time")
+            or record.get("publish_time")
+        ):
+            score += 1
+        return score
+
+    @classmethod
+    def _preferred_candidate_bonus(cls, path: tuple[str, ...]) -> int:
+        bonuses = {
+            "organic": 6,
+            "results": 5,
+            "items": 4,
+            "documents": 3,
+            "docs": 3,
+            "pages": 2,
+            "value": 1,
+            "data": 0,
+        }
+        return sum(bonuses.get(segment, 0) for segment in path)
+
+    @classmethod
+    def _collect_dict_list_candidates(
+        cls, payload: Any, path: tuple[str, ...] = ()
+    ) -> list[tuple[tuple[str, ...], list[dict[str, Any]]]]:
+        candidates: list[tuple[tuple[str, ...], list[dict[str, Any]]]] = []
         if isinstance(payload, list):
             dict_items = [item for item in payload if isinstance(item, dict)]
             if dict_items:
-                return dict_items
-            for item in payload:
-                found = cls._find_list_of_dicts(item)
-                if found:
-                    return found
-            return []
+                candidates.append((path, dict_items))
+            for index, item in enumerate(payload):
+                candidates.extend(cls._collect_dict_list_candidates(item, path + (str(index),)))
+            return candidates
 
         if isinstance(payload, dict):
-            preferred_keys = [
-                "organic",
-                "results",
-                "items",
-                "data",
-                "documents",
-                "docs",
-                "value",
-                "pages",
-            ]
-            for key in preferred_keys:
-                value = payload.get(key)
-                if isinstance(value, list) and any(isinstance(item, dict) for item in value):
-                    return [item for item in value if isinstance(item, dict)]
-                found = cls._find_list_of_dicts(value)
-                if found:
-                    return found
-            for value in payload.values():
-                found = cls._find_list_of_dicts(value)
-                if found:
-                    return found
-        return []
+            preferred_keys = ["organic", "results", "items", "data", "documents", "docs", "value", "pages"]
+            iter_keys = preferred_keys + [key for key in payload.keys() if key not in preferred_keys]
+            for key in iter_keys:
+                if key in payload:
+                    candidates.extend(cls._collect_dict_list_candidates(payload[key], path + (key,)))
+        return candidates
+
+    @classmethod
+    def _find_list_of_dicts(cls, payload: Any) -> list[dict[str, Any]]:
+        candidates = cls._collect_dict_list_candidates(payload)
+        best_records: list[dict[str, Any]] = []
+        best_score: tuple[float, int, int] | None = None
+
+        for path, records in candidates:
+            record_scores = [cls._score_result_record(record) for record in records]
+            total_score = sum(record_scores)
+            max_score = max(record_scores, default=0)
+            bonus = cls._preferred_candidate_bonus(path)
+            candidate_score = (max_score, total_score + bonus, len(records))
+            if best_score is None or candidate_score > best_score:
+                best_score = candidate_score
+                best_records = records
+
+        if best_score is None or best_score[0] <= 0:
+            return []
+        return best_records
 
     @classmethod
     def _extract_result_records(cls, payload: Any) -> list[dict[str, Any]]:

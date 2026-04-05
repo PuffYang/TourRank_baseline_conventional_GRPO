@@ -47,6 +47,14 @@ class ToolParser(ABC):
     def __init__(self, tokenizer) -> None:
         self.tokenizer = tokenizer
 
+    def get_stop_strings(self) -> list[str]:
+        """Return stop strings that should end generation as soon as a tool call is complete."""
+        return []
+
+    def should_include_stop_strings_in_output(self) -> bool:
+        """Whether rollout should keep the stop string in generated output for parsing."""
+        return False
+
     @abstractmethod
     async def extract_tool_calls(
         self, responses_ids: list[int], tools: list[OpenAIFunctionToolSchema] = None
@@ -87,6 +95,12 @@ class HermesToolParser(ToolParser):
         self.tool_call_start_token: str = "<tool_call>"
         self.tool_call_end_token: str = "</tool_call>"
         self.tool_call_regex = regex.compile(r"<tool_call>(.*?)</tool_call>", regex.DOTALL)
+
+    def get_stop_strings(self) -> list[str]:
+        return [self.tool_call_end_token]
+
+    def should_include_stop_strings_in_output(self) -> bool:
+        return True
 
     @rollout_trace_op
     async def extract_tool_calls(
@@ -136,6 +150,12 @@ class GptOssToolParser(ToolParser):
             r"<\|constrain\|>json<\|message\|>(.*?)<\|call\|>",
             regex.DOTALL,
         )
+
+    def get_stop_strings(self) -> list[str]:
+        return ["<|call|>"]
+
+    def should_include_stop_strings_in_output(self) -> bool:
+        return True
 
     @rollout_trace_op
     async def extract_tool_calls(
@@ -191,6 +211,12 @@ class Qwen3XMLToolParser(ToolParser):
         self.tool_call_regex = regex.compile(r"<tool_call>(.*?)</tool_call>|<tool_call>(.*?)$", regex.DOTALL)
         self.tool_call_function_regex = regex.compile(r"<function=(.*?)</function>|<function=(.*)$", regex.DOTALL)
         self.tool_call_parameter_regex = regex.compile(r"<parameter=(.*?)</parameter>|<parameter=(.*?)$", regex.DOTALL)
+
+    def get_stop_strings(self) -> list[str]:
+        return [self.tool_call_end_token]
+
+    def should_include_stop_strings_in_output(self) -> bool:
+        return True
 
     def _parse_xml_function_call(
         self, function_call_str: str, tools: Optional[list[OpenAIFunctionToolSchema]]
@@ -349,11 +375,18 @@ class DrTuluXMLToolParser(ToolParser):
 
     def __init__(self, tokenizer) -> None:
         super().__init__(tokenizer)
+        self.tool_call_end_token = "</call_tool>"
         self.tool_call_regex = regex.compile(
             r"<call_tool\s+name=\"([^\"]+)\"([^>]*)>(.*?)</call_tool>",
             regex.DOTALL,
         )
         self.attribute_regex = regex.compile(r'([A-Za-z_][A-Za-z0-9_]*)=\"([^\"]*)\"')
+
+    def get_stop_strings(self) -> list[str]:
+        return [self.tool_call_end_token]
+
+    def should_include_stop_strings_in_output(self) -> bool:
+        return True
 
     @staticmethod
     def _infer_primary_arg_name(tool_name: str, tools: Optional[list[OpenAIFunctionToolSchema]]) -> str:

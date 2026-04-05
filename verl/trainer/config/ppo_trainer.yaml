@@ -178,10 +178,10 @@ trainer:
     researchqa_file: researchqa_val.jsonl
 
     # Grader model used by the HealthBench official evaluator
-    healthbench_grader_model: "gpt-4.1-2025-04-14"
+    healthbench_grader_model: "gpt-4o"
 
     # Scorer model used by the SQA-CS-V2 official evaluator
-    sqa_scorer_model: "google/gemini-2.5-flash"
+    sqa_scorer_model: "openai/gpt-4o"
 
     # Maximum concurrent scorer connections for SQA-CS-V2 evaluation
     sqa_max_connections: 16

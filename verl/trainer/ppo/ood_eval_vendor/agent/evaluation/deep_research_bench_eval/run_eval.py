@@ -20,7 +20,9 @@ Usage:
         --max_workers 10 --only_en --limit 5
 
 Environment Variables Required:
-    GEMINI_API_KEY: Google Gemini API key (for both RACE and FACT evaluation)
+    AZURE_OPENAI_API_KEY: Azure GPT-4o API key (preferred)
+    AZURE_OPENAI_ENDPOINT: Azure GPT-4o endpoint
+    OPENAI_API_VERSION: Azure GPT-4o API version
 
 Data files (bundled in data/ subdirectory):
     - data/prompt_data/query.jsonl
@@ -34,6 +36,7 @@ import json
 import logging
 import os
 import re
+import sys
 import threading
 import time
 from pathlib import Path
@@ -52,13 +55,16 @@ logger.setLevel(logging.INFO)
 # Constants
 # ============================================================================
 SCRIPT_DIR = Path(__file__).parent
+sys.path.insert(0, str(SCRIPT_DIR.parent))
 DATA_DIR = SCRIPT_DIR / "data"
 HF_EVAL_DATA_REPO = "rl-research/dr-tulu-eval-data"
 MAX_RETRIES = 10
 
-# Gemini model configuration
-FACT_MODEL = "gemini-2.5-flash"
-RACE_MODEL = "gemini-2.5-pro"
+from shared_azure_gpt4o import create_chat_completion_text, resolve_azure_gpt4o_model
+
+# Azure GPT-4o model configuration
+FACT_MODEL = "gpt-4o"
+RACE_MODEL = "gpt-4o"
 
 
 def _ensure_data_files() -> tuple:
@@ -272,32 +278,18 @@ def contains_chinese(text: str) -> bool:
 
 
 # ============================================================================
-# Gemini API Client
+# Azure GPT-4o client (keeps the original class name for compatibility)
 # ============================================================================
 class GeminiClient:
-    """Client for calling Gemini API."""
+    """Compatibility client that routes DRB judge calls to Azure GPT-4o."""
 
     def __init__(self, api_key: str = None, model: str = RACE_MODEL):
-        try:
-            from google import genai
-            from google.genai import types
-        except ImportError:
-            raise ImportError(
-                "google-genai package required. Install with: pip install google-genai"
-            )
-
-        self.api_key = api_key or os.environ.get("GEMINI_API_KEY", "")
+        self.api_key = api_key or os.environ.get("AZURE_OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
         if not self.api_key:
             raise ValueError(
-                "Gemini API key not provided. Set GEMINI_API_KEY environment variable."
+                "Azure GPT-4o API key not provided. Set AZURE_OPENAI_API_KEY environment variable."
             )
-
-        self.client = genai.Client(
-            api_key=self.api_key, http_options={"timeout": 600000}
-        )
-        self.model = model
-        self._genai = genai
-        self._types = types
+        self.model = resolve_azure_gpt4o_model(model)
 
     def generate(
         self,
@@ -305,21 +297,21 @@ class GeminiClient:
         system_prompt: str = "",
         model: str = None,
     ) -> str:
-        """Generate text response from Gemini."""
-        model_to_use = model or self.model
-        contents = []
+        """Generate text response from Azure GPT-4o."""
+        model_to_use = resolve_azure_gpt4o_model(model or self.model)
+        messages: list[dict[str, str]] = []
         if system_prompt:
-            contents.append({"role": "system", "parts": [{"text": system_prompt}]})
-        contents.append({"role": "user", "parts": [{"text": user_prompt}]})
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": user_prompt})
 
-        response = self.client.models.generate_content(
+        response_text, _ = create_chat_completion_text(
+            messages=messages,
             model=model_to_use,
-            contents=contents,
-            config=self._types.GenerateContentConfig(
-                thinking_config=self._types.ThinkingConfig(thinking_budget=16000)
-            ),
+            temperature=0.0,
+            max_tokens=5000,
+            timeout=600,
         )
-        return response.text
+        return response_text
 
 
 # ============================================================================
@@ -1628,11 +1620,11 @@ Examples:
     logger.info(f"Output: {args.output_dir}")
 
     # Check API key
-    if not os.environ.get("GEMINI_API_KEY"):
-        logger.error("GEMINI_API_KEY environment variable not set")
+    if not (os.environ.get("AZURE_OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY")):
+        logger.error("AZURE_OPENAI_API_KEY environment variable not set")
         return
 
-    # Initialize Gemini client
+    # Initialize Azure GPT-4o client
     llm_client = GeminiClient(model=RACE_MODEL)
 
     # Step 1: Format conversion

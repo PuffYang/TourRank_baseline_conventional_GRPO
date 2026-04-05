@@ -1,11 +1,10 @@
 import time
-import os
 from typing import Any
 
 import openai
-from openai import OpenAI, AzureOpenAI
 
 from .._types import MessageList, SamplerBase, SamplerResponse
+from ...shared_azure_gpt4o import create_chat_completion, get_azure_openai_client, resolve_azure_gpt4o_model
 
 OPENAI_SYSTEM_MESSAGE_API = "You are a helpful assistant."
 OPENAI_SYSTEM_MESSAGE_CHATGPT = (
@@ -27,16 +26,8 @@ class ChatCompletionSampler(SamplerBase):
         max_tokens: int = 4096,
     ):
         self.api_key_name = "OPENAI_API_KEY"
-        if os.environ.get("AZURE_OPENAI_ENDPOINT"):
-            self.client = AzureOpenAI(
-                api_key=os.environ.get("AZURE_OPENAI_API_KEY"),
-                api_version=os.environ.get("OPENAI_API_VERSION"),
-                azure_endpoint=os.environ.get("AZURE_OPENAI_ENDPOINT"),
-            )
-        else:
-            self.client = OpenAI()
-        # using api_key=os.environ.get("OPENAI_API_KEY")  # please set your API_KEY
-        self.model = model
+        self.client = get_azure_openai_client()
+        self.model = resolve_azure_gpt4o_model(model)
         self.system_message = system_message
         self.temperature = temperature
         self.max_tokens = max_tokens
@@ -71,11 +62,13 @@ class ChatCompletionSampler(SamplerBase):
         trial = 0
         while True:
             try:
-                response = self.client.chat.completions.create(
-                    model=self.model,
+                response = create_chat_completion(
+                    client=self.client,
                     messages=message_list,
+                    model=self.model,
                     temperature=self.temperature,
                     max_tokens=self.max_tokens,
+                    timeout=200,
                 )
                 content = response.choices[0].message.content
                 if content is None:

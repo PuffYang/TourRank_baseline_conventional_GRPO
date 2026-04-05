@@ -1,13 +1,18 @@
 import argparse
 import json
 import logging
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
 
-import openai
 from retry import retry
 from tqdm import tqdm
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR.parent))
+
+from shared_azure_gpt4o import create_chat_completion_text, resolve_azure_gpt4o_model
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -58,11 +63,20 @@ def load_researchqa_data(json_path: str) -> List[ResearchQAItem]:
 
 
 def call_gpt(prompt: str, model: str = "gpt-4") -> str:
-    client = openai.OpenAI()
-    response = client.chat.completions.create(
-        model=model, messages=[{"role": "user", "content": prompt}], temperature=0
+    response_text, _ = create_chat_completion_text(
+        messages=[
+            {
+                "role": "system",
+                "content": "You are a careful evaluation assistant. Return only the requested judgments.",
+            },
+            {"role": "user", "content": prompt},
+        ],
+        model=resolve_azure_gpt4o_model(model),
+        temperature=0.0,
+        max_tokens=2048,
+        timeout=200,
     )
-    return response.choices[0].message.content.strip()
+    return response_text.strip()
 
 
 def build_prompt(response: str, questions: List[str]) -> str:
@@ -146,7 +160,7 @@ def compute_coverage(
     response_map: Dict[str, Dict[str, str]],
     output_path: Optional[str] = None,
     batch_size: int = 8,
-    model: str = "gpt-4.1-mini",
+    model: str = "gpt-4o",
 ):
     # Load questions
     items = load_researchqa_data(data_path)
@@ -234,7 +248,7 @@ if __name__ == "__main__":
         "--batch_size", type=int, default=8, help="Batch size for rubric items"
     )
     parser.add_argument(
-        "--model", type=str, default="gpt-4.1-mini", help="OpenAI model name"
+        "--model", type=str, default="gpt-4o", help="Azure GPT-4o model name"
     )
     args = parser.parse_args()
     compute_coverage(

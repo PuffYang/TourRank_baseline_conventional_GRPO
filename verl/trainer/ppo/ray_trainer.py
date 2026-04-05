@@ -924,11 +924,6 @@ class RayPPOTrainer:
                 if metric2val
             }
 
-            core_score_metric_name = f"mean@{n_max_by_var.get(core_var, 1)}"
-            core_score_metric_val = var2metric2val.get(core_var, {}).get(core_score_metric_name)
-            if isinstance(core_score_metric_val, (int, float)):
-                metric_dict[f"val-score/{data_source}/score"] = float(core_score_metric_val)
-
             for var_name, metric2val in var2metric2val.items():
                 n_max = n_max_by_var[var_name]
                 for metric_name, metric_val in metric2val.items():
