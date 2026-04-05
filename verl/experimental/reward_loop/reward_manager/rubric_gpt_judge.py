@@ -60,6 +60,9 @@ class RubricGPTJudgeRewardManager(RewardManagerBase):
         self.score_range_max = float(judge_cfg.get("score_range_max", 10.0))
         self.equal_score_reward = float(judge_cfg.get("equal_score_reward", 0.5))
         self.lose_score = float(judge_cfg.get("lose_score", 0.0))
+        self.content_filter_fallback_reward = float(
+            judge_cfg.get("content_filter_fallback_reward", self.equal_score_reward)
+        )
 
         api_key = judge_cfg.get("api_key") or os.getenv("AZURE_OPENAI_API_KEY")
         api_version = judge_cfg.get("api_version", "2024-06-01")
@@ -133,9 +136,8 @@ class RubricGPTJudgeRewardManager(RewardManagerBase):
         except Exception as exc:
             if not self.fallback_to_first_on_error:
                 raise
-            raw_score = self.score_range_min
-            normalized_score = self.lose_score
-            logger.warning("Judge failed, fallback to lose_score. error=%s", exc)
+            raw_score, normalized_score = self._fallback_score_on_error(exc)
+            logger.warning("Judge failed, fallback to safe default. error=%s", exc)
 
         final_reward = float(normalized_score + weighted_format_reward)
         return {
@@ -317,6 +319,11 @@ class RubricGPTJudgeRewardManager(RewardManagerBase):
 
         cleaned = text
         cleaned = re.sub(r"https?://\S+", "[url]", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\b(sex|sexual|sexy|porn|pornographic|erotic)\b", "[sensitive_term]", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\b(nude|nudity|naked|explicit)\b", "[sensitive_term]", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\b(vagina|penis|breast|breasts|genital|genitals)\b", "[sensitive_term]", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\b(minor|child|children|teen|underage)\b", "[age_term]", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\b(assault|abuse|abused|harass|harassment)\b", "[sensitive_term]", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"\b(kill|killed|killing|kills)\b", "[violent_term]", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"\b(murder|murdered|murdering)\b", "[violent_term]", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"\b(attack|attacked|attacking|attacks)\b", "[violent_term]", cleaned, flags=re.IGNORECASE)
@@ -327,6 +334,7 @@ class RubricGPTJudgeRewardManager(RewardManagerBase):
         cleaned = re.sub(r"\b(rape|raped|raping)\b", "[sensitive_term]", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"\b(suicide|self-harm)\b", "[sensitive_term]", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"\b(violent|violence)\b", "[sensitive_term]", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"(性|色情|裸|裸体|露骨|未成年|儿童|青少年|虐待|骚扰)", "[sensitive_term]", cleaned)
         cleaned = re.sub(r"(杀|谋杀|袭击|枪击|枪杀|刺伤|炸弹|爆炸|恐怖|恐袭|自杀|强奸|暴力|血腥)", "[sensitive_term]", cleaned)
         cleaned = re.sub(r"\s+", " ", cleaned).strip()
         if not cleaned:
@@ -358,6 +366,13 @@ class RubricGPTJudgeRewardManager(RewardManagerBase):
             or "responsibleaipolicyviolation" in text
             or "content management policy" in text
         )
+
+    def _fallback_score_on_error(self, exc: Exception) -> tuple[float, float]:
+        if self._is_content_filter_error(exc):
+            normalized = float(self.content_filter_fallback_reward)
+            raw = self.score_range_min + normalized * (self.score_range_max - self.score_range_min)
+            return raw, normalized
+        return self.score_range_min, self.lose_score
 
     def _judge_rollout(
         self,
