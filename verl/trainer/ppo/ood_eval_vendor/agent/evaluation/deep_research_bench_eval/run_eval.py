@@ -24,7 +24,7 @@ Environment Variables Required:
     AZURE_OPENAI_ENDPOINT: Azure GPT-4o endpoint
     OPENAI_API_VERSION: Azure GPT-4o API version
 
-Data files (bundled in data/ subdirectory):
+Data files (bundled in data/ subdirectory or provided via DRB_EVAL_DATA_DIR):
     - data/prompt_data/query.jsonl
     - data/criteria_data/criteria.jsonl
     - data/test_data/cleaned_data/reference.jsonl
@@ -70,20 +70,54 @@ RACE_MODEL = "gpt-4o"
 def _ensure_data_files() -> tuple:
     """
     Ensure DRB evaluation data files are available locally.
-    Downloads from HuggingFace if not found in local data/ directory.
+    Prefers vendored local files and only downloads from HuggingFace when
+    DRB_DOWNLOAD_MISSING_EVAL_DATA=1 is set.
 
     Returns:
         (criteria_file, reference_file, query_file) paths
     """
-    criteria_file = DATA_DIR / "criteria_data" / "criteria.jsonl"
-    reference_file = DATA_DIR / "test_data" / "cleaned_data" / "reference.jsonl"
-    query_file = DATA_DIR / "prompt_data" / "query.jsonl"
+    def _resolve_from_base(base_dir: Path) -> tuple[Path, Path, Path]:
+        return (
+            base_dir / "criteria_data" / "criteria.jsonl",
+            base_dir / "test_data" / "cleaned_data" / "reference.jsonl",
+            base_dir / "prompt_data" / "query.jsonl",
+        )
 
-    # Check if all files exist locally
-    if criteria_file.exists() and reference_file.exists() and query_file.exists():
-        return criteria_file, reference_file, query_file
+    candidate_dirs: list[Path] = []
+    override_dir = os.environ.get("DRB_EVAL_DATA_DIR")
+    if override_dir:
+        candidate_dirs.append(Path(override_dir).expanduser())
+    candidate_dirs.append(DATA_DIR)
 
-    # Download from HuggingFace
+    for candidate_dir in candidate_dirs:
+        criteria_file, reference_file, query_file = _resolve_from_base(candidate_dir)
+        if criteria_file.exists() and reference_file.exists() and query_file.exists():
+            logger.info(f"Using local DRB evaluation data from {candidate_dir}")
+            return criteria_file, reference_file, query_file
+
+    if os.environ.get("DRB_DOWNLOAD_MISSING_EVAL_DATA", "0") != "1":
+        searched = []
+        for candidate_dir in candidate_dirs:
+            criteria_file, reference_file, query_file = _resolve_from_base(candidate_dir)
+            searched.extend(
+                [
+                    str(criteria_file),
+                    str(reference_file),
+                    str(query_file),
+                ]
+            )
+        raise FileNotFoundError(
+            "DeepResearch Bench evaluation data not found locally. "
+            "Sync the vendored files under "
+            f"{DATA_DIR} or set DRB_EVAL_DATA_DIR to a directory containing "
+            "criteria_data/criteria.jsonl, test_data/cleaned_data/reference.jsonl, "
+            "and prompt_data/query.jsonl. "
+            f"Searched: {searched}"
+        )
+
+    criteria_file, reference_file, query_file = _resolve_from_base(DATA_DIR)
+
+    # Download from HuggingFace only when explicitly enabled
     logger.info(f"Downloading DRB evaluation data from {HF_EVAL_DATA_REPO}...")
     try:
         from huggingface_hub import hf_hub_download

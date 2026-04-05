@@ -44,6 +44,7 @@ from typing import Any, Dict, List, Optional
 # Import DR Tulu format conversion from Varsha's script (single source of truth)
 FILE_DIR = Path(__file__).resolve().parent
 EVAL_ROOT = FILE_DIR.parent
+SQA_DATA_DIR = FILE_DIR / "data"
 sys.path.insert(0, str(FILE_DIR))
 sys.path.insert(0, str(EVAL_ROOT))
 from convert_to_asta_format import parse_answer
@@ -210,17 +211,62 @@ def _normalize_sqa_scorer_model(scorer_model: str) -> str:
     return resolved if "/" in resolved else f"openai/{resolved}"
 
 
+def _resolve_local_sqa_rubrics_dir() -> Path:
+    override_dir = os.environ.get("SQA_RUBRICS_DATA_DIR")
+    if override_dir:
+        return Path(override_dir).expanduser()
+    return SQA_DATA_DIR
+
+
+def _expected_sqa_rubrics_filename(split: str) -> str:
+    version = "v2" if split == "test" else "v1"
+    return f"rubrics_{version}_recomputed.json"
+
+
+def _has_local_sqa_rubrics(split: str) -> bool:
+    expected = _resolve_local_sqa_rubrics_dir() / "tasks" / "sqa" / _expected_sqa_rubrics_filename(split)
+    return expected.exists()
+
+
 def _build_openai_sitecustomize() -> str:
     return f'''
 import os
+import shutil
+from pathlib import Path
 
 DEFAULT_ENDPOINT = {DEFAULT_AZURE_OPENAI_ENDPOINT!r}
 DEFAULT_API_VERSION = {DEFAULT_AZURE_OPENAI_API_VERSION!r}
+DEFAULT_SQA_RUBRICS_DIR = {str(_resolve_local_sqa_rubrics_dir())!r}
 
 os.environ.setdefault("AZURE_OPENAI_ENDPOINT", DEFAULT_ENDPOINT)
 os.environ.setdefault("OPENAI_API_VERSION", DEFAULT_API_VERSION)
 if os.environ.get("AZURE_OPENAI_API_KEY") and not os.environ.get("OPENAI_API_KEY"):
     os.environ["OPENAI_API_KEY"] = os.environ["AZURE_OPENAI_API_KEY"]
+
+try:
+    import huggingface_hub
+
+    _original_hf_hub_download = huggingface_hub.hf_hub_download
+
+    def _patched_hf_hub_download(repo_id, filename, *args, **kwargs):
+        local_root = Path(os.environ.get("SQA_RUBRICS_DATA_DIR", DEFAULT_SQA_RUBRICS_DIR)).expanduser()
+        local_path = local_root / filename
+        if repo_id == "allenai/asta-bench" and local_path.exists():
+            return str(local_path)
+        downloaded = _original_hf_hub_download(repo_id, filename, *args, **kwargs)
+        if (
+            repo_id == "allenai/asta-bench"
+            and os.environ.get("SQA_DOWNLOAD_MISSING_DATA", "0") == "1"
+        ):
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            if not local_path.exists():
+                shutil.copy2(downloaded, local_path)
+            return str(local_path)
+        return downloaded
+
+    huggingface_hub.hf_hub_download = _patched_hf_hub_download
+except Exception as exc:
+    print(f"WARNING: Failed to patch hf_hub_download for local SQA rubrics: {{exc}}")
 
 try:
     import openai
@@ -490,13 +536,15 @@ override-dependencies = [
         env["OPENAI_API_KEY"] = env["AZURE_OPENAI_API_KEY"]
     env.setdefault("AZURE_OPENAI_ENDPOINT", DEFAULT_AZURE_OPENAI_ENDPOINT)
     env.setdefault("OPENAI_API_VERSION", DEFAULT_AZURE_OPENAI_API_VERSION)
+    env.setdefault("SQA_RUBRICS_DATA_DIR", str(_resolve_local_sqa_rubrics_dir()))
     env["PYTHONPATH"] = (
         solver_dir
         if not env.get("PYTHONPATH")
         else f"{solver_dir}{os.pathsep}{env['PYTHONPATH']}"
     )
-    # HF_TOKEN is needed for downloading gated allenai/asta-bench dataset
-    if not env.get("HF_TOKEN"):
+    has_local_rubrics = _has_local_sqa_rubrics(split)
+    # HF_TOKEN is only needed when local SQA rubrics are unavailable.
+    if not env.get("HF_TOKEN") and not has_local_rubrics:
         # Try to get token from huggingface-cli login cache
         try:
             from huggingface_hub import HfFolder
@@ -506,11 +554,13 @@ override-dependencies = [
                 print(f"Using cached HF token from huggingface-cli login")
         except Exception:
             pass
-    if not env.get("HF_TOKEN"):
+    if not env.get("HF_TOKEN") and not has_local_rubrics:
         print("WARNING: HF_TOKEN not set. Needed for gated allenai/asta-bench dataset.")
         print("  Run: huggingface-cli login")
         print("  Or set: export HF_TOKEN='your_token'")
         print("  And request access at: https://huggingface.co/datasets/allenai/asta-bench")
+    elif has_local_rubrics:
+        print(f"Using local SQA rubrics from: {_resolve_local_sqa_rubrics_dir()}")
 
     # Run the evaluation
     result = subprocess.run(cmd, cwd=solver_dir, env=env, capture_output=True, text=True)

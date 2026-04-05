@@ -154,7 +154,7 @@ trainer:
     run_on_initial_validation: False
 
     # Local directory containing prepared OOD benchmark JSONL files
-    data_dir: /mnt/tidal-alsh-share2/usr/yangzixuan/TourRank/DR-Tulu/data/RL/preprocess/val
+    data_dir: /mnt/tidal-alsh-share2/usr/yangzixuan/TourRank/DR-Tulu/data/RL/val
 
     # Subdirectory name under each checkpoint step folder for OOD validation outputs
     output_subdir: ood_validation

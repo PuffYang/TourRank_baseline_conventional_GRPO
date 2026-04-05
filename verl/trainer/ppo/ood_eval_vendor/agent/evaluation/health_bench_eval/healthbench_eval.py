@@ -39,6 +39,7 @@ from tqdm import tqdm
 INPUT_PATH = "https://openaipublic.blob.core.windows.net/simple-evals/healthbench/2025-05-07-06-14-12_oss_eval.jsonl"
 INPUT_PATH_HARD = "https://openaipublic.blob.core.windows.net/simple-evals/healthbench/hard_2025-05-08-21-00-10.jsonl"
 INPUT_PATH_CONSENSUS = "https://openaipublic.blob.core.windows.net/simple-evals/healthbench/consensus_2025-05-09-20-00-46.jsonl"
+HEALTHBENCH_DATA_DIR = Path(__file__).resolve().parent / "data"
 
 GRADER_TEMPLATE = """
 Your job is to look at a conversation and a rubric item, and score the last turn (i.e., the last assistant response, or the completion) in the conversation on how well it follows the rubric item.
@@ -131,6 +132,15 @@ def _download_healthbench_file(remote_url: str, local_path: str, hf_filename: st
     with urllib.request.urlopen(remote_url) as response, tmp_path.open("wb") as f:
         f.write(response.read())
     tmp_path.replace(local_file)
+
+
+def _resolve_healthbench_local_path(filename: str) -> Path:
+    override_dir = os.environ.get("HEALTHBENCH_DATA_DIR")
+    if override_dir:
+        override_path = Path(override_dir).expanduser() / filename
+        if override_path.exists():
+            return override_path
+    return HEALTHBENCH_DATA_DIR / filename
 
 
 def parse_json_to_dict(json_string: str) -> dict:
@@ -370,29 +380,30 @@ class HealthBenchEval(Eval):
         if subset_name == "hard":
             input_path = INPUT_PATH_HARD
             hf_filename = "hard_2025-05-08-21-00-10.jsonl"
-            input_local_path = (
-                "./evaluation/health_bench_eval/data/hard_2025-05-08-21-00-10.jsonl"
-            )
+            input_local_path = _resolve_healthbench_local_path(hf_filename)
         elif subset_name == "consensus":
             input_path = INPUT_PATH_CONSENSUS
             hf_filename = "consensus_2025-05-09-20-00-46.jsonl"
-            input_local_path = "./evaluation/health_bench_eval/data/consensus_2025-05-09-20-00-46.jsonl"
+            input_local_path = _resolve_healthbench_local_path(hf_filename)
         elif subset_name in (None, "all"):
             input_path = INPUT_PATH
             hf_filename = "2025-05-07-06-14-12_oss_eval.jsonl"
-            input_local_path = (
-                "./evaluation/health_bench_eval/data/2025-05-07-06-14-12_oss_eval.jsonl"
-            )
+            input_local_path = _resolve_healthbench_local_path(hf_filename)
         else:
             raise ValueError(f"Invalid subset name: {subset_name}")
 
-        if os.path.exists(input_local_path):
+        if input_local_path.exists():
             # Load from local file if it exists
-            with open(input_local_path, "r") as f:
+            with input_local_path.open("r") as f:
                 examples = [json.loads(line) for line in f]
         else:
-            _download_healthbench_file(input_path, input_local_path, hf_filename)
-            with open(input_local_path, "r") as f:
+            if os.environ.get("HEALTHBENCH_DOWNLOAD_MISSING_DATA", "0") != "1":
+                raise FileNotFoundError(
+                    "HealthBench evaluation data not found locally. "
+                    f"Sync {hf_filename} under {HEALTHBENCH_DATA_DIR} or set HEALTHBENCH_DATA_DIR."
+                )
+            _download_healthbench_file(input_path, str(input_local_path), hf_filename)
+            with input_local_path.open("r") as f:
                 examples = [json.loads(line) for line in f]
 
         for example in examples:
