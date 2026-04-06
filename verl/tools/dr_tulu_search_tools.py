@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import os
 from typing import Any, Optional
 from uuid import uuid4
@@ -11,6 +12,7 @@ from .schemas import OpenAIFunctionParametersSchema, OpenAIFunctionPropertySchem
 from .schemas import OpenAIFunctionToolSchema, ToolResponse
 
 DEFAULT_TIMEOUT = int(os.getenv("API_TIMEOUT", "30"))
+logger = logging.getLogger(__name__)
 
 
 def _require_env_var(name: str) -> str:
@@ -521,6 +523,16 @@ class SnippetSearchTool(_DrTuluBaseTool):
         fallback_on_request_error = bool(self.config.get("fallback_on_request_error", True))
 
         if not api_key and fallback_on_missing_api_key:
+            logger.warning(
+                "snippet_search fallback triggered: reason=missing_s2_api_key query=%r parameters=%s",
+                query,
+                {
+                    "limit": parameters.get("limit"),
+                    "year": parameters.get("year"),
+                    "fieldsOfStudy": parameters.get("fieldsOfStudy"),
+                    "venue": parameters.get("venue"),
+                },
+            )
             return self._build_fallback_response(
                 instance_id=instance_id,
                 query=query,
@@ -572,6 +584,18 @@ class SnippetSearchTool(_DrTuluBaseTool):
             return ToolResponse(text=self._wrap_tool_output(blocks)), 0.0, metrics
         except Exception as e:
             if fallback_on_request_error:
+                logger.warning(
+                    "snippet_search fallback triggered: reason=request_error query=%r error_type=%s error=%s parameters=%s",
+                    query,
+                    type(e).__name__,
+                    str(e),
+                    {
+                        "limit": parameters.get("limit"),
+                        "year": parameters.get("year"),
+                        "fieldsOfStudy": parameters.get("fieldsOfStudy"),
+                        "venue": parameters.get("venue"),
+                    },
+                )
                 return self._build_fallback_response(
                     instance_id=instance_id,
                     query=query,
