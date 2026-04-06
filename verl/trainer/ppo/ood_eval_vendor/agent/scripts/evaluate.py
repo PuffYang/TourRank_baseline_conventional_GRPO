@@ -124,7 +124,12 @@ def save_evaluation_results(results_path: str, task_name: str, final_result, gen
         json.dump(results_data, f, indent=2, default=str)
 
 
-def evaluate_healthbench(file_path: str, save_path: str | None, grader_model: str) -> None:
+def evaluate_healthbench(
+    file_path: str,
+    save_path: str | None,
+    grader_model: str,
+    n_threads: int,
+) -> None:
     original_examples = load_jsonl(file_path)
     converted_examples = convert_to_evaluate_format(original_examples)
 
@@ -134,7 +139,7 @@ def evaluate_healthbench(file_path: str, save_path: str | None, grader_model: st
         max_tokens=1000,
         temperature=0,
     )
-    eval_class = HealthBenchEval(grader_model=grader_sampler)
+    eval_class = HealthBenchEval(grader_model=grader_sampler, n_threads=n_threads)
     eval_results = eval_class.evaluate(converted_examples)
     final_result = common.aggregate_results(eval_results)
 
@@ -150,7 +155,13 @@ def evaluate_healthbench(file_path: str, save_path: str | None, grader_model: st
     print(f"Results saved to: {results_path}")
 
 
-def evaluate_researchqa(file_path: str, save_path: str | None, grader_model: str) -> None:
+def evaluate_researchqa(
+    file_path: str,
+    save_path: str | None,
+    grader_model: str,
+    n_threads: int,
+    batch_size: int,
+) -> None:
     input_dir = Path(file_path).parent
     input_name = Path(file_path).stem
     results_path = Path(save_path) if save_path is not None else input_dir / f"{input_name}_eval_results.json"
@@ -168,8 +179,9 @@ def evaluate_researchqa(file_path: str, save_path: str | None, grader_model: str
         data_path=data_path,
         response_map=response_map,
         output_path=None,
-        batch_size=10,
+        batch_size=batch_size,
         model=resolve_azure_gpt4o_model(grader_model),
+        n_threads=n_threads,
     )
     coverage = sum(coverages) / len(coverages) if coverages else 0.0
     aggregated_metrics = _aggregate_researchqa_metrics(data_path, results)
@@ -208,6 +220,18 @@ def main() -> None:
         default="gpt-4o",
         help="Model to use for grading",
     )
+    parser.add_argument(
+        "--n-threads",
+        type=int,
+        default=16,
+        help="Maximum number of concurrent judge worker threads",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=10,
+        help="Number of rubric items grouped into a single ResearchQA judge call",
+    )
     args = parser.parse_args()
 
     if not os.path.exists(args.file_path):
@@ -216,9 +240,15 @@ def main() -> None:
         raise ValueError(f"File must be a JSONL file: {args.file_path}")
 
     if args.task == "healthbench":
-        evaluate_healthbench(args.file_path, args.save_path, args.grader_model)
+        evaluate_healthbench(args.file_path, args.save_path, args.grader_model, args.n_threads)
     else:
-        evaluate_researchqa(args.file_path, args.save_path, grader_model=args.grader_model)
+        evaluate_researchqa(
+            args.file_path,
+            args.save_path,
+            grader_model=args.grader_model,
+            n_threads=args.n_threads,
+            batch_size=args.batch_size,
+        )
 
 
 if __name__ == "__main__":

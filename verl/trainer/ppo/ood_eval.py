@@ -406,7 +406,25 @@ class OODValidationRunner:
         ]
 
         if spec.eval_task == "healthbench":
-            command.extend(["--grader-model", str(self.config.healthbench_grader_model)])
+            command.extend(
+                [
+                    "--grader-model",
+                    str(self.config.healthbench_grader_model),
+                    "--n-threads",
+                    str(self.config.healthbench_n_threads),
+                ]
+            )
+        elif spec.eval_task == "researchqa":
+            command.extend(
+                [
+                    "--grader-model",
+                    str(self.config.healthbench_grader_model),
+                    "--n-threads",
+                    str(self.config.researchqa_n_threads),
+                    "--batch-size",
+                    str(self.config.researchqa_batch_size),
+                ]
+            )
 
         self._run_subprocess(command, cwd=self._agent_root, log_dir=benchmark_dir)
         if not result_path.exists():
@@ -426,6 +444,8 @@ class OODValidationRunner:
             f"{spec.slug}_step_{self.trainer.global_steps}",
             "--output_dir",
             str(benchmark_dir),
+            "--max_workers",
+            str(self.config.deep_research_bench_max_workers),
         ]
         self._run_subprocess(command, cwd=self._agent_root, log_dir=benchmark_dir)
 

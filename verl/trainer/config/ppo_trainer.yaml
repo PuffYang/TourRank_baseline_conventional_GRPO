@@ -186,6 +186,18 @@ trainer:
     # Maximum concurrent scorer connections for SQA-CS-V2 evaluation
     sqa_max_connections: 16
 
+    # Maximum concurrent GPT-4o workers for DeepResearch Bench evaluation
+    deep_research_bench_max_workers: 10
+
+    # Number of concurrent grading threads for HealthBench evaluation
+    healthbench_n_threads: 120
+
+    # Number of concurrent ResearchQA items to score in parallel
+    researchqa_n_threads: 16
+
+    # Number of rubric items grouped into a single ResearchQA judge call
+    researchqa_batch_size: 10
+
   # Number of nodes used in the training
   nnodes: 1
 

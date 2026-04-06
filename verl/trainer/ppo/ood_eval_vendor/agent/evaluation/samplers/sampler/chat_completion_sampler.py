@@ -4,7 +4,19 @@ from typing import Any
 import openai
 
 from .._types import MessageList, SamplerBase, SamplerResponse
-from ...shared_azure_gpt4o import create_chat_completion, get_azure_openai_client, resolve_azure_gpt4o_model
+
+try:
+    from ...shared_azure_gpt4o import (
+        create_chat_completion,
+        get_azure_openai_client,
+        resolve_azure_gpt4o_model,
+    )
+except ImportError:
+    from evaluation.shared_azure_gpt4o import (
+        create_chat_completion,
+        get_azure_openai_client,
+        resolve_azure_gpt4o_model,
+    )
 
 OPENAI_SYSTEM_MESSAGE_API = "You are a helpful assistant."
 OPENAI_SYSTEM_MESSAGE_CHATGPT = (

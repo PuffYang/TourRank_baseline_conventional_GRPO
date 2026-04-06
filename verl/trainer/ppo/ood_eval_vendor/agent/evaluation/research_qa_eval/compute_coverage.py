@@ -1,4 +1,5 @@
 import argparse
+import concurrent.futures
 import json
 import logging
 import sys
@@ -161,6 +162,7 @@ def compute_coverage(
     output_path: Optional[str] = None,
     batch_size: int = 8,
     model: str = "gpt-4o",
+    n_threads: int = 1,
 ):
     # Load questions
     items = load_researchqa_data(data_path)
@@ -173,12 +175,11 @@ def compute_coverage(
     print(
         f"Computing coverage for {len(items)} items out of {len(original_items)} total items."
     )
-    for item in tqdm(items, desc="Computing rubric coverage"):
+    def _score_single_item(item: ResearchQAItem) -> tuple[str, Optional[list[dict]], Optional[float]]:
         item_id = item.id
         answer = response_map[item_id]["answer"]
         rubric_items = [r.rubric_item for r in item.rubric]
         rubric_judges = []
-        item_processing_failed = False
 
         for i in range(0, len(rubric_items), batch_size):
             batch = rubric_items[i : i + batch_size]
@@ -201,18 +202,43 @@ def compute_coverage(
                 logger.error(
                     f"Failed to get correct number of results for batch after all retries. Skipping item {item_id}. Error: {e}"
                 )
-                item_processing_failed = True
-                break
+                return item_id, None, None
 
-        # Skip this item if any batch failed
-        if item_processing_failed:
-            continue
-
-        results[item_id] = rubric_judges
-        # Compute and print coverage for this item
         item_coverage = compute_coverage_score(rubric_judges)
-        coverages.append(item_coverage)
-        logger.info(f"Coverage for {item_id}: {item_coverage:.3f}")
+        return item_id, rubric_judges, item_coverage
+
+    if n_threads <= 1:
+        iterator = (
+            _score_single_item(item)
+            for item in tqdm(items, desc="Computing rubric coverage")
+        )
+        for item_id, rubric_judges, item_coverage in iterator:
+            if rubric_judges is None or item_coverage is None:
+                continue
+            results[item_id] = rubric_judges
+            coverages.append(item_coverage)
+            logger.info(f"Coverage for {item_id}: {item_coverage:.3f}")
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n_threads) as executor:
+            future_to_item = {
+                executor.submit(_score_single_item, item): item.id for item in items
+            }
+            for future in tqdm(
+                concurrent.futures.as_completed(future_to_item),
+                total=len(future_to_item),
+                desc="Computing rubric coverage",
+            ):
+                item_id = future_to_item[future]
+                try:
+                    _, rubric_judges, item_coverage = future.result()
+                except Exception as e:
+                    logger.error(f"Unexpected failure while scoring item {item_id}: {e}")
+                    continue
+                if rubric_judges is None or item_coverage is None:
+                    continue
+                results[item_id] = rubric_judges
+                coverages.append(item_coverage)
+                logger.info(f"Coverage for {item_id}: {item_coverage:.3f}")
 
     if output_path:
         # Save results
@@ -250,7 +276,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model", type=str, default="gpt-4o", help="Azure GPT-4o model name"
     )
+    parser.add_argument(
+        "--n_threads", type=int, default=1, help="Concurrent ResearchQA items to score"
+    )
     args = parser.parse_args()
     compute_coverage(
-        args.data, args.responses, args.output, args.batch_size, args.model
+        args.data, args.responses, args.output, args.batch_size, args.model, args.n_threads
     )
