@@ -12,11 +12,14 @@ tools:
   - class_name: verl.tools.dr_tulu_search_tools.SnippetSearchTool
     config:
       type: native
-      timeout: 30
+      timeout: 20
       limit: 5
       min_interval_seconds: 1.1
-      fallback_on_missing_api_key: true
-      fallback_on_request_error: true
+      serialize_requests: true
+      max_retries: 3
+      retry_backoff_seconds: 1.0
+      fallback_on_missing_api_key: false
+      fallback_on_request_error: false
       fallback_message: Semantic Scholar API is unavailable, so this placeholder snippet is returned only for debugging the training pipeline.
 
   - class_name: verl.tools.dr_tulu_search_tools.BrowseWebpageTool

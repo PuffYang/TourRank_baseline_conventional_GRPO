@@ -18,6 +18,28 @@ DEFAULT_TIMEOUT = int(os.getenv("API_TIMEOUT", "30"))
 logger = logging.getLogger(__name__)
 
 
+class _RetriableRequestError(RuntimeError):
+    def __init__(self, message: str, retry_after_seconds: Optional[float] = None):
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
+
+
+def _as_bool(value: Any, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    return default
+
+
 class _FileBackedRateLimiter:
     def __init__(self, lock_path: str, min_interval_seconds: float):
         self.lock_path = lock_path
@@ -52,6 +74,37 @@ class _FileBackedRateLimiter:
             os.fsync(handle.fileno())
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
             return wait_seconds
+
+    def run_serialized(self, fn):
+        os.makedirs(os.path.dirname(self.lock_path), exist_ok=True)
+        with open(self.lock_path, "a+", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            handle.seek(0)
+            raw = handle.read().strip()
+            now = time.time()
+            last_ts = 0.0
+            if raw:
+                try:
+                    last_ts = float(raw)
+                except ValueError:
+                    last_ts = 0.0
+
+            wait_seconds = max(0.0, last_ts + self.min_interval_seconds - now)
+            if wait_seconds > 0:
+                time.sleep(wait_seconds)
+
+            try:
+                result = fn(wait_seconds)
+            finally:
+                next_ts = time.time()
+                handle.seek(0)
+                handle.truncate()
+                handle.write(f"{next_ts:.6f}")
+                handle.flush()
+                os.fsync(handle.fileno())
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+        return result
 
 
 def _require_env_var(name: str) -> str:
@@ -494,6 +547,12 @@ class SnippetSearchTool(_DrTuluBaseTool):
             )
         )
         self._rate_limiter = _FileBackedRateLimiter(rate_limit_file, min_interval_seconds)
+        self.max_retries = max(1, int(config.get("max_retries", os.getenv("S2_MAX_RETRIES", "3"))))
+        self.retry_backoff_seconds = max(
+            0.0, float(config.get("retry_backoff_seconds", os.getenv("S2_RETRY_BACKOFF_SECONDS", "1.0")))
+        )
+        self.serialize_requests = _as_bool(config.get("serialize_requests", True), True)
+        self.retriable_status_codes = {429, 500, 502, 503, 504}
 
     def _build_fallback_response(
         self,
@@ -574,48 +633,108 @@ class SnippetSearchTool(_DrTuluBaseTool):
             return ToolResponse(text="Error: query is required."), 0.0, {"status": "error"}
 
         api_key = os.getenv("S2_API_KEY")
-        fallback_on_missing_api_key = bool(self.config.get("fallback_on_missing_api_key", True))
-        fallback_on_request_error = bool(self.config.get("fallback_on_request_error", True))
+        fallback_on_missing_api_key = _as_bool(self.config.get("fallback_on_missing_api_key", True), True)
+        fallback_on_request_error = _as_bool(self.config.get("fallback_on_request_error", True), True)
 
-        if not api_key and fallback_on_missing_api_key:
-            logger.warning(
-                "snippet_search fallback triggered: reason=missing_s2_api_key query=%r parameters=%s",
-                query,
-                {
-                    "limit": parameters.get("limit"),
-                    "year": parameters.get("year"),
-                    "fieldsOfStudy": parameters.get("fieldsOfStudy"),
-                    "venue": parameters.get("venue"),
-                },
+        if not api_key:
+            if fallback_on_missing_api_key:
+                logger.warning(
+                    "snippet_search fallback triggered: reason=missing_s2_api_key query=%r parameters=%s",
+                    query,
+                    {
+                        "limit": parameters.get("limit"),
+                        "year": parameters.get("year"),
+                        "fieldsOfStudy": parameters.get("fieldsOfStudy"),
+                        "venue": parameters.get("venue"),
+                    },
+                )
+                return self._build_fallback_response(
+                    instance_id=instance_id,
+                    query=query,
+                    reason="missing_s2_api_key",
+                    parameters=parameters,
+                )
+            error_message = (
+                "Error performing snippet_search: S2_API_KEY environment variable is not set. "
+                "The verl tool implementation does not auto-load .env files; please export S2_API_KEY "
+                "in the training environment before launching the job."
             )
-            return self._build_fallback_response(
-                instance_id=instance_id,
-                query=query,
-                reason="missing_s2_api_key",
-                parameters=parameters,
-            )
+            return ToolResponse(text=error_message), 0.0, {"status": "error", "error": error_message}
 
         def _search():
+            params = {
+                "query": query,
+                "limit": int(parameters.get("limit", self.config.get("limit", 5))),
+                **({"year": parameters["year"]} if parameters.get("year") else {}),
+                **({"venue": parameters["venue"]} if parameters.get("venue") else {}),
+            }
+
+            def _attempt_request(waited: float):
+                if waited > 0:
+                    logger.info(
+                        "snippet_search rate limiter slept %.2fs before query=%r",
+                        waited,
+                        query,
+                    )
+
+                last_error: Optional[Exception] = None
+                for attempt in range(1, self.max_retries + 1):
+                    try:
+                        response = requests.get(
+                            "https://api.semanticscholar.org/graph/v1/snippet/search",
+                            params=params,
+                            headers={"x-api-key": api_key},
+                            timeout=self.timeout,
+                        )
+                        if response.status_code in self.retriable_status_codes:
+                            retry_after = response.headers.get("Retry-After")
+                            retry_after_seconds = None
+                            if retry_after:
+                                try:
+                                    retry_after_seconds = float(retry_after)
+                                except ValueError:
+                                    retry_after_seconds = None
+                            raise _RetriableRequestError(
+                                (
+                                    "Semantic Scholar snippet_search returned retryable status "
+                                    f"{response.status_code}: {response.text[:300]}"
+                                ),
+                                retry_after_seconds=retry_after_seconds,
+                            )
+                        response.raise_for_status()
+                        return response.json()
+                    except (
+                        requests.exceptions.Timeout,
+                        requests.exceptions.ConnectionError,
+                        requests.exceptions.ReadTimeout,
+                        _RetriableRequestError,
+                    ) as e:
+                        last_error = e
+                        if attempt >= self.max_retries:
+                            break
+                        sleep_seconds = getattr(e, "retry_after_seconds", None)
+                        if sleep_seconds is None:
+                            sleep_seconds = self.retry_backoff_seconds * (2 ** (attempt - 1))
+                        logger.warning(
+                            "snippet_search retrying query=%r attempt=%d/%d sleep=%.2fs error_type=%s error=%s",
+                            query,
+                            attempt,
+                            self.max_retries,
+                            sleep_seconds,
+                            type(e).__name__,
+                            str(e),
+                        )
+                        time.sleep(sleep_seconds)
+
+                if last_error is None:
+                    raise RuntimeError("snippet_search failed without an explicit exception")
+                raise last_error
+
+            if self.serialize_requests:
+                return self._rate_limiter.run_serialized(_attempt_request)
+
             waited = self._rate_limiter.wait()
-            if waited > 0:
-                logger.info(
-                    "snippet_search rate limiter slept %.2fs before query=%r",
-                    waited,
-                    query,
-                )
-            response = requests.get(
-                "https://api.semanticscholar.org/graph/v1/snippet/search",
-                params={
-                    "query": query,
-                    "limit": int(parameters.get("limit", self.config.get("limit", 5))),
-                    **({"year": parameters["year"]} if parameters.get("year") else {}),
-                    **({"venue": parameters["venue"]} if parameters.get("venue") else {}),
-                },
-                headers={"x-api-key": api_key} if api_key else None,
-                timeout=self.timeout,
-            )
-            response.raise_for_status()
-            return response.json()
+            return _attempt_request(waited)
 
         try:
             payload = await asyncio.to_thread(_search)
@@ -664,7 +783,12 @@ class SnippetSearchTool(_DrTuluBaseTool):
                     reason=f"request_error:{type(e).__name__}",
                     parameters=parameters,
                 )
-            return ToolResponse(text=f"Error performing snippet_search: {e}"), 0.0, {"status": "error", "error": str(e)}
+            error_message = (
+                "Error performing snippet_search: "
+                f"{type(e).__name__}: {e}. "
+                "This request was not replaced with a placeholder because fallback_on_request_error is disabled."
+            )
+            return ToolResponse(text=error_message), 0.0, {"status": "error", "error": error_message}
 
 
 class BrowseWebpageTool(_DrTuluBaseTool):
