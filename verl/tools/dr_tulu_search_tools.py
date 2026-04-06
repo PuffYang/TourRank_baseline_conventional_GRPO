@@ -1,7 +1,10 @@
 import asyncio
+import fcntl
 import json
 import logging
 import os
+import tempfile
+import time
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -13,6 +16,42 @@ from .schemas import OpenAIFunctionToolSchema, ToolResponse
 
 DEFAULT_TIMEOUT = int(os.getenv("API_TIMEOUT", "30"))
 logger = logging.getLogger(__name__)
+
+
+class _FileBackedRateLimiter:
+    def __init__(self, lock_path: str, min_interval_seconds: float):
+        self.lock_path = lock_path
+        self.min_interval_seconds = max(float(min_interval_seconds), 0.0)
+
+    def wait(self) -> float:
+        if self.min_interval_seconds <= 0:
+            return 0.0
+
+        os.makedirs(os.path.dirname(self.lock_path), exist_ok=True)
+        with open(self.lock_path, "a+", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            handle.seek(0)
+            raw = handle.read().strip()
+            now = time.time()
+            last_ts = 0.0
+            if raw:
+                try:
+                    last_ts = float(raw)
+                except ValueError:
+                    last_ts = 0.0
+
+            wait_seconds = max(0.0, last_ts + self.min_interval_seconds - now)
+            if wait_seconds > 0:
+                time.sleep(wait_seconds)
+
+            next_ts = time.time()
+            handle.seek(0)
+            handle.truncate()
+            handle.write(f"{next_ts:.6f}")
+            handle.flush()
+            os.fsync(handle.fileno())
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            return wait_seconds
 
 
 def _require_env_var(name: str) -> str:
@@ -440,6 +479,22 @@ class GoogleSearchTool(_DrTuluBaseTool):
 
 
 class SnippetSearchTool(_DrTuluBaseTool):
+    def __init__(self, config: dict, tool_schema: Optional[OpenAIFunctionToolSchema] = None):
+        super().__init__(config, tool_schema)
+        min_interval_seconds = float(
+            config.get("min_interval_seconds", os.getenv("S2_MIN_INTERVAL_SECONDS", "1.1"))
+        )
+        rate_limit_file = self._clean_text(
+            config.get(
+                "rate_limit_file",
+                os.getenv(
+                    "S2_RATE_LIMIT_FILE",
+                    os.path.join(tempfile.gettempdir(), "verl_snippet_search_rate_limit.txt"),
+                ),
+            )
+        )
+        self._rate_limiter = _FileBackedRateLimiter(rate_limit_file, min_interval_seconds)
+
     def _build_fallback_response(
         self,
         instance_id: str,
@@ -541,6 +596,13 @@ class SnippetSearchTool(_DrTuluBaseTool):
             )
 
         def _search():
+            waited = self._rate_limiter.wait()
+            if waited > 0:
+                logger.info(
+                    "snippet_search rate limiter slept %.2fs before query=%r",
+                    waited,
+                    query,
+                )
             response = requests.get(
                 "https://api.semanticscholar.org/graph/v1/snippet/search",
                 params={
