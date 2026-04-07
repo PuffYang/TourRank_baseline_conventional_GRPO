@@ -25,6 +25,7 @@ from omegaconf import DictConfig
 from verl import DataProto
 from verl.experimental.reward_loop.reward_manager import register
 from verl.experimental.reward_loop.reward_manager.base import RewardManagerBase
+from verl.utils.reward_score.search_r1_like_qa_em import compute_format_reward as compute_search_r1_format_reward
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -39,6 +40,7 @@ class RubricGPTJudgeRewardManager(RewardManagerBase):
     def __init__(self, config: DictConfig, tokenizer, compute_score, reward_router_address=None, reward_model_tokenizer=None):
         super().__init__(config, tokenizer, compute_score)
         judge_cfg = config.reward.get("gpt_judge", {})
+        reward_kwargs = config.reward.get("reward_kwargs", {})
 
         self.model = judge_cfg.get("model", "gpt-4o")
         self.temperature = float(judge_cfg.get("temperature", 0.0))
@@ -52,6 +54,7 @@ class RubricGPTJudgeRewardManager(RewardManagerBase):
 
         self.max_rollout_chars = int(judge_cfg.get("max_rollout_chars", 12000))
         self.fallback_to_first_on_error = bool(judge_cfg.get("fallback_to_first_on_error", True))
+        self.format_penalty = str(reward_kwargs.get("format_penalty", "easy"))
 
         # Judge returns raw score in [score_range_min, score_range_max], default [0, 10].
         # reward_score used by trainer is normalized into [0, 1].
@@ -172,7 +175,7 @@ class RubricGPTJudgeRewardManager(RewardManagerBase):
         valid_response_length = int(data_item.batch["attention_mask"][-response_length:].sum().item())
         valid_response_ids = response_ids[:valid_response_length].tolist()
         response = self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
-        format_reward = self._compute_format_reward(response)
+        format_reward = self._compute_format_reward(response, format_penalty=self.format_penalty)
         weighted_format_reward = FORMAT_REWARD_WEIGHT * format_reward
         return response, format_reward, weighted_format_reward
 
@@ -207,20 +210,14 @@ class RubricGPTJudgeRewardManager(RewardManagerBase):
         return [match[1].strip() for match in matches if match[1].strip()]
 
     @classmethod
-    def _compute_format_reward(cls, text: str) -> float:
+    def _compute_format_reward(cls, text: str, format_penalty: str = "easy") -> float:
         response = text or ""
         mcp_parser_name = "dr_tulu_xml" if "<call_tool name=" in response else None
-
-        answer_match = re.search(r"<answer>.*?</answer>", response, re.DOTALL)
-        answer_format_reward = 1.0 if answer_match else 0.0
-
-        citation_match = re.search(r"<cite id=[\"\']?[^\"\'>\s]+[\"\']?[^>]*>[^<]+</cite>", response, re.DOTALL)
-        citation_format_reward = 1.0 if citation_match else 0.0
-
-        queries = cls._extract_search_tool_calls(response, mcp_parser_name=mcp_parser_name)
-        query_format_reward = 1.0 if queries else 0.0
-
-        return 0.5 * answer_format_reward + 0.3 * citation_format_reward + 0.2 * query_format_reward
+        return compute_search_r1_format_reward(
+            response,
+            mcp_parser_name=mcp_parser_name,
+            format_penalty=format_penalty,
+        )
 
     @staticmethod
     def _prepare_response_for_judge(text: str) -> str:

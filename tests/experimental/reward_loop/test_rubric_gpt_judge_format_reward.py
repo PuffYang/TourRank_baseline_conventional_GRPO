@@ -26,7 +26,7 @@ def test_compute_format_reward_matches_dr_tulu_weights():
         '<answer><cite id="s1">The next Olympics are in Italy.</cite></answer>'
     )
 
-    reward = RubricGPTJudgeRewardManager._compute_format_reward(response)
+    reward = RubricGPTJudgeRewardManager._compute_format_reward(response, format_penalty="easy")
 
     assert reward == 1.0
     assert FORMAT_REWARD_WEIGHT * reward == 0.2
@@ -35,6 +35,32 @@ def test_compute_format_reward_matches_dr_tulu_weights():
 def test_compute_format_reward_is_partial_when_only_answer_exists():
     response = "<answer>Just the answer.</answer>"
 
-    reward = RubricGPTJudgeRewardManager._compute_format_reward(response)
+    reward = RubricGPTJudgeRewardManager._compute_format_reward(response, format_penalty="easy")
 
     assert reward == 0.5
+
+
+def test_compute_format_reward_supports_strict_success_case():
+    response = (
+        '<call_tool name="google_search">next olympics</call_tool>'
+        '<tool_output><snippet id="s1">Title: Example</snippet></tool_output>'
+        '<answer><cite id="s1">The next Olympics are in Italy.</cite></answer>'
+    )
+
+    reward = RubricGPTJudgeRewardManager._compute_format_reward(response, format_penalty="strict")
+
+    assert reward == 0.0
+    assert FORMAT_REWARD_WEIGHT * reward == 0.0
+
+
+def test_compute_format_reward_supports_strict_failure_case():
+    response = (
+        '<call_tool name="google_search">next olympics</call_tool>'
+        '<answer><cite id="s1">The next Olympics are in Italy.</cite></answer>'
+        '<think>extra trailing block</think>'
+    )
+
+    reward = RubricGPTJudgeRewardManager._compute_format_reward(response, format_penalty="strict")
+
+    assert reward == -1.0
+    assert FORMAT_REWARD_WEIGHT * reward == -0.2
