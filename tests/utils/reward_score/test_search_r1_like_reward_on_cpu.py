@@ -41,7 +41,7 @@ def test_compute_score_falls_back_to_format_reward():
     assert result["accuracy_reward"] == 0.0
     assert result["format_reward"] == 1.0
     assert result["weighted_format_reward"] == 0.2
-    assert result["score"] == 0.2
+    assert result["score"] == 1.0
 
 
 def test_compute_format_reward_strict_requires_single_final_answer_block():
@@ -90,5 +90,5 @@ def test_compute_score_strict_applies_negative_format_penalty():
 
     assert result["accuracy_reward"] == 0.0
     assert result["format_reward"] == -1.0
-    assert result["weighted_format_reward"] == -0.2
-    assert result["score"] == -0.2
+    assert "weighted_format_reward" not in result
+    assert result["score"] == -1.0

@@ -142,16 +142,19 @@ class RubricGPTJudgeRewardManager(RewardManagerBase):
             raw_score, normalized_score = self._fallback_score_on_error(exc)
             logger.warning("Judge failed, fallback to safe default. error=%s", exc)
 
-        final_reward = float(normalized_score + weighted_format_reward)
+        final_reward = float(normalized_score + format_reward)
+        reward_extra_info = {
+            "gpt_judge_raw_score": float(raw_score),
+            "gpt_judge_normalized_score": float(normalized_score),
+            "format_reward": float(format_reward),
+            "final_reward": final_reward,
+        }
+        if self.format_penalty == "easy":
+            reward_extra_info["weighted_format_reward"] = float(weighted_format_reward)
+
         return {
             "reward_score": final_reward,
-            "reward_extra_info": {
-                "gpt_judge_raw_score": float(raw_score),
-                "gpt_judge_normalized_score": float(normalized_score),
-                "format_reward": float(format_reward),
-                "weighted_format_reward": float(weighted_format_reward),
-                "final_reward": final_reward,
-            },
+            "reward_extra_info": reward_extra_info,
         }
 
     def _extract_query_and_rubrics(self, data_item: DataProto) -> tuple[str, list[dict[str, Any]]]:

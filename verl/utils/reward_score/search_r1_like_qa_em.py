@@ -289,13 +289,15 @@ def compute_score(
     reward_score = compute_score_subem(
         solution_str=solution_str,
         ground_truth=ground_truth,
-        format_score=weighted_format_reward,
+        format_score=format_reward,
         method=method,
         score=score,
     )
-    return {
+    result = {
         "score": reward_score,
         "format_reward": format_reward,
-        "weighted_format_reward": weighted_format_reward,
         "accuracy_reward": float(is_correct),
     }
+    if format_penalty == "easy":
+        result["weighted_format_reward"] = weighted_format_reward
+    return result
