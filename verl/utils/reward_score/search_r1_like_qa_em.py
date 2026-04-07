@@ -124,7 +124,18 @@ def extract_search_tool_calls(context: str, mcp_parser_name: Optional[str] = Non
     return [match[1].strip() for match in matches if match[1].strip()]
 
 
-def compute_format_reward(
+def _normalize_format_penalty(format_penalty: Optional[str]) -> str:
+    penalty = (format_penalty or "easy").lower()
+    if penalty not in {"easy", "strict"}:
+        raise ValueError(f"Unsupported format_penalty: {format_penalty!r}. Expected 'easy' or 'strict'.")
+    return penalty
+
+
+def _extract_answer_blocks(response: str) -> list[re.Match[str]]:
+    return list(re.finditer(r"<answer>.*?</answer>", response, re.DOTALL))
+
+
+def _compute_easy_format_reward(
     response: str, mcp_parser_name: Optional[str] = None, use_full_response_as_answer: bool = False
 ) -> float:
     if use_full_response_as_answer:
@@ -140,6 +151,50 @@ def compute_format_reward(
     query_format_reward = 1.0 if queries else 0.0
 
     return 0.5 * answer_format_reward + 0.3 * citation_format_reward + 0.2 * query_format_reward
+
+
+def _compute_strict_format_reward(
+    response: str, mcp_parser_name: Optional[str] = None, use_full_response_as_answer: bool = False
+) -> float:
+    if use_full_response_as_answer:
+        return -1.0
+
+    answer_blocks = _extract_answer_blocks(response)
+    open_count, close_count = count_answer_tags(response)
+    has_single_answer_block = len(answer_blocks) == 1 and open_count == 1 and close_count == 1
+
+    answer_is_last_top_level_block = False
+    if has_single_answer_block:
+        answer_block = answer_blocks[0].group(0).strip()
+        answer_is_last_top_level_block = response.strip().endswith(answer_block)
+
+    citation_match = re.search(r"<cite id=[\"\']?[^\"\'>\s]+[\"\']?[^>]*>[^<]+</cite>", response, re.DOTALL)
+    queries = extract_search_tool_calls(response, mcp_parser_name=mcp_parser_name)
+
+    if has_single_answer_block and answer_is_last_top_level_block and citation_match and queries:
+        return 0.0
+    return -1.0
+
+
+def compute_format_reward(
+    response: str,
+    mcp_parser_name: Optional[str] = None,
+    use_full_response_as_answer: bool = False,
+    format_penalty: str = "easy",
+) -> float:
+    format_penalty = _normalize_format_penalty(format_penalty)
+    if format_penalty == "strict":
+        return _compute_strict_format_reward(
+            response,
+            mcp_parser_name=mcp_parser_name,
+            use_full_response_as_answer=use_full_response_as_answer,
+        )
+
+    return _compute_easy_format_reward(
+        response,
+        mcp_parser_name=mcp_parser_name,
+        use_full_response_as_answer=use_full_response_as_answer,
+    )
 
 
 FORMAT_REWARD_WEIGHT = 0.2
@@ -208,13 +263,26 @@ def compute_score_subem(solution_str, ground_truth, method="strict", format_scor
             return format_score
 
 
-def compute_score(solution_str, ground_truth, method="strict", format_score=0.0, score=1.0, extra_info=None, **kwargs):
+def compute_score(
+    solution_str,
+    ground_truth,
+    method="strict",
+    format_score=0.0,
+    score=1.0,
+    extra_info=None,
+    format_penalty="easy",
+    **kwargs,
+):
     extra_info = extra_info or {}
     mcp_parser_name = extra_info.get("mcp_parser_name")
     if mcp_parser_name is None and "<call_tool name=" in solution_str:
         mcp_parser_name = "dr_tulu_xml"
 
-    format_reward = compute_format_reward(solution_str, mcp_parser_name=mcp_parser_name)
+    format_reward = compute_format_reward(
+        solution_str,
+        mcp_parser_name=mcp_parser_name,
+        format_penalty=format_penalty,
+    )
     weighted_format_reward = FORMAT_REWARD_WEIGHT * format_reward
     answer = extract_solution(solution_str=solution_str)
     is_correct = answer is not None and subem_check(answer, ground_truth["target"])

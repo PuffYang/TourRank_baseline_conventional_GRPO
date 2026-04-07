@@ -42,3 +42,53 @@ def test_compute_score_falls_back_to_format_reward():
     assert result["format_reward"] == 1.0
     assert result["weighted_format_reward"] == 0.2
     assert result["score"] == 0.2
+
+
+def test_compute_format_reward_strict_requires_single_final_answer_block():
+    response = (
+        '<think>search first</think>'
+        '<call_tool name="google_search">latest ai news</call_tool>'
+        '<tool_output><snippet id="s1">Title: A</snippet></tool_output>'
+        '<answer><cite id="s1">AI is in the news.</cite></answer>'
+    )
+
+    reward = search_r1_like_qa_em.compute_format_reward(
+        response,
+        mcp_parser_name="dr_tulu_xml",
+        format_penalty="strict",
+    )
+
+    assert reward == 0.0
+
+
+def test_compute_format_reward_strict_penalizes_non_final_answer_block():
+    response = (
+        '<call_tool name="google_search">latest ai news</call_tool>'
+        '<answer><cite id="s1">AI is in the news.</cite></answer>'
+        '<think>extra trailing block</think>'
+    )
+
+    reward = search_r1_like_qa_em.compute_format_reward(
+        response,
+        mcp_parser_name="dr_tulu_xml",
+        format_penalty="strict",
+    )
+
+    assert reward == -1.0
+
+
+def test_compute_score_strict_applies_negative_format_penalty():
+    response = (
+        '<think>search first</think>'
+        '<call_tool name="google_search">latest ai news</call_tool>'
+        '<answer><cite id="s1">wrong answer</cite></answer>'
+        '<think>extra trailing block</think>'
+    )
+    ground_truth = {"target": ["correct answer"]}
+
+    result = search_r1_like_qa_em.compute_score(response, ground_truth, format_penalty="strict")
+
+    assert result["accuracy_reward"] == 0.0
+    assert result["format_reward"] == -1.0
+    assert result["weighted_format_reward"] == -0.2
+    assert result["score"] == -0.2

@@ -102,7 +102,14 @@ def load_reward_manager(config: DictConfig, tokenizer: Any, **reward_kwargs: Any
     # Try to get a custom reward function based on the configuration
     # user defined reward manager can be registered in custom_reward_fn
     compute_score = get_custom_reward_fn(config)
+    config_reward_kwargs = dict(config.reward.get("reward_kwargs", {}))
     final_compute_score = compute_score
+
+    if compute_score is not None and config_reward_kwargs:
+        if not inspect.iscoroutinefunction(compute_score):
+            final_compute_score = partial(_call_with_kwargs, compute_score, config_reward_kwargs)
+        else:
+            final_compute_score = partial(_call_with_kwargs_async, compute_score, config_reward_kwargs)
 
     reward_manager_cfg: RewardManagerConfig = config.reward.reward_manager
     reward_manager_cls: type[RewardManagerBase]
@@ -135,12 +142,16 @@ def load_reward_manager(config: DictConfig, tokenizer: Any, **reward_kwargs: Any
             _concurrent_semaphore = sandbox_manager.Semaphore(sandbox_config.get("max_concurrent", 64))
             final_compute_score = partial(
                 default_compute_score_,
+                **config_reward_kwargs,
                 sandbox_fusion_url=sandbox_url,
                 concurrent_semaphore=_concurrent_semaphore,
                 memory_limit_mb=memory_limit_mb,
             )
         else:
-            final_compute_score = default_compute_score_
+            if config_reward_kwargs:
+                final_compute_score = partial(default_compute_score_, **config_reward_kwargs)
+            else:
+                final_compute_score = default_compute_score_
 
     # Instantiate and return the reward manager with the specified parameters
     return reward_manager_cls(
