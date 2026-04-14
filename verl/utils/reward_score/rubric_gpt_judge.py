@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import logging
 import os
@@ -88,7 +90,8 @@ def _extract_query_and_rubrics(ground_truth: Any, extra_info: dict[str, Any] | N
     return query, rubrics
 
 
-def _compute_format_reward(text: str, format_penalty: str = "easy") -> float:
+def _compute_format_reward(text: str, format_penalty: str = "easy") -> dict[str, float] | float:
+    """Compute format reward.  Returns a dict for strict mode, float for easy."""
     mcp_parser_name = "dr_tulu_xml" if "<call_tool name=" in (text or "") else None
     return compute_search_r1_format_reward(
         text or "",
@@ -349,8 +352,7 @@ def compute_score(
     cfg = _get_judge_config(gpt_judge=gpt_judge, **kwargs)
 
     query, rubrics = _extract_query_and_rubrics(ground_truth, extra_info=extra_info)
-    format_reward = _compute_format_reward(solution_str, format_penalty=format_penalty)
-    weighted_format_reward = FORMAT_REWARD_WEIGHT * format_reward
+    format_result = _compute_format_reward(solution_str, format_penalty=format_penalty)
     rollout_text = _prepare_response_for_judge(solution_str)
     if len(rollout_text) > int(cfg["max_rollout_chars"]):
         rollout_text = rollout_text[: int(cfg["max_rollout_chars"])]
@@ -388,15 +390,34 @@ def compute_score(
         raw_score, normalized_score = _fallback_score_on_error(exc, cfg)
         logger.warning("Judge failed, fallback to safe default. error=%s", exc)
 
-    final_reward = float(normalized_score + format_reward)
+    # --- Compute effective format reward and final reward ---
+    if format_penalty == "strict":
+        # strict mode: format_result is a dict with format_reward, retrieval_reward, sum_format_reward
+        format_reward = float(format_result["format_reward"])
+        retrieval_reward = float(format_result["retrieval_reward"])
+        sum_format_reward = float(format_result["sum_format_reward"])
+        effective_format_reward = sum_format_reward
+    else:
+        # easy mode: format_result is a float, apply weighting
+        format_reward = float(format_result)
+        weighted_format_reward = FORMAT_REWARD_WEIGHT * format_reward
+        effective_format_reward = weighted_format_reward
+
+    final_reward = float(normalized_score + effective_format_reward)
+
     result = {
         "score": final_reward,
         "gpt_judge_raw_score": float(raw_score),
         "gpt_judge_normalized_score": float(normalized_score),
-        "format_reward": float(format_reward),
         "final_reward": final_reward,
     }
-    if format_penalty == "easy":
+
+    if format_penalty == "strict":
+        result["format_reward"] = format_reward
+        result["retrieval_reward"] = retrieval_reward
+        result["sum_format_reward"] = sum_format_reward
+    else:
+        result["format_reward"] = format_reward
         result["weighted_format_reward"] = float(weighted_format_reward)
     return result
 

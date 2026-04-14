@@ -39,8 +39,9 @@ class NaiveRewardManager(RewardManagerBase):
         valid_response_length = data_item.batch["attention_mask"][-response_length:].sum()
         valid_response_ids = response_ids[:valid_response_length]
 
-        data_source = data_item.non_tensor_batch["data_source"]
-        ground_truth = data_item.non_tensor_batch["reward_model"]["ground_truth"]
+        data_source = data_item.non_tensor_batch.get("data_source", "unknown")
+        reward_model = data_item.non_tensor_batch.get("reward_model", None)
+        ground_truth = reward_model["ground_truth"] if isinstance(reward_model, dict) else None
         extra_info = data_item.non_tensor_batch.get("extra_info", {})
         tool_extra_fields = data_item.non_tensor_batch.get("tool_extra_fields", None)
         if tool_extra_fields is not None:

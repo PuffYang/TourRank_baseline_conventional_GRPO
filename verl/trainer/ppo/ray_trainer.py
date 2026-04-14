@@ -450,6 +450,8 @@ class RayPPOTrainer:
             "gpt_judge_raw_score",
             "gpt_judge_normalized_score",
             "format_reward",
+            "retrieval_reward",
+            "sum_format_reward",
             "weighted_format_reward",
             "final_reward",
         ]
@@ -529,17 +531,26 @@ class RayPPOTrainer:
         if raw_score.size > 0:
             metrics["training/gpt_judge_raw_score"] = float(np.mean(raw_score))
 
+        normalized_score = self._to_1d_float_array(reward_extra_infos_dict.get("gpt_judge_normalized_score"))
+        if normalized_score.size > 0:
+            metrics["training/gpt_judge_normalized_score"] = float(np.mean(normalized_score))
+
+        # Format reward metrics (strict mode: 3 separate metrics; easy mode: 2 metrics)
         format_reward = self._to_1d_float_array(reward_extra_infos_dict.get("format_reward"))
         if format_reward.size > 0:
             metrics["training/format_reward"] = float(np.mean(format_reward))
 
+        retrieval_reward = self._to_1d_float_array(reward_extra_infos_dict.get("retrieval_reward"))
+        if retrieval_reward.size > 0:
+            metrics["training/retrieval_reward"] = float(np.mean(retrieval_reward))
+
+        sum_format_reward = self._to_1d_float_array(reward_extra_infos_dict.get("sum_format_reward"))
+        if sum_format_reward.size > 0:
+            metrics["training/sum_format_reward"] = float(np.mean(sum_format_reward))
+
         weighted_format_reward = self._to_1d_float_array(reward_extra_infos_dict.get("weighted_format_reward"))
         if weighted_format_reward.size > 0:
             metrics["training/weighted_format_reward"] = float(np.mean(weighted_format_reward))
-
-        normalized_score = self._to_1d_float_array(reward_extra_infos_dict.get("gpt_judge_normalized_score"))
-        if normalized_score.size > 0:
-            metrics["training/gpt_judge_normalized_score"] = float(np.mean(normalized_score))
 
         final_reward = np.array([], dtype=np.float32)
         for key in ("final_reward", "reward"):

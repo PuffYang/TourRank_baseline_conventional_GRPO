@@ -26,8 +26,3 @@ tools:
     config:
       type: native
       timeout: 30
-
-  - class_name: verl.tools.dr_tulu_search_tools.DownloadFileTool
-    config:
-      type: native
-      timeout: 30

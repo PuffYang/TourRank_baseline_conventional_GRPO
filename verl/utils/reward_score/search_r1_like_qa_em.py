@@ -15,10 +15,12 @@
 # limitations under the License.
 # Adapted from https://github.com/PeterGriffinJin/Search-R1/blob/main/verl/utils/reward_score/qa_em.py
 
+from __future__ import annotations
+
 import random
 import re
 import string
-from typing import Optional
+from typing import Dict, Optional, Union
 
 
 def normalize_answer(s):
@@ -153,27 +155,112 @@ def _compute_easy_format_reward(
     return 0.5 * answer_format_reward + 0.3 * citation_format_reward + 0.2 * query_format_reward
 
 
+def _extract_model_generated_text(response: str) -> str:
+    """Extract only the model-generated portions from a multi-turn response.
+
+    In a multi-turn agent loop the full decoded response has the structure::
+
+        [MODEL_TEXT] \\nuser\\n [SYSTEM_TOOL_RESPONSE] \\nassistant\\n [MODEL_TEXT] ...
+
+    The ``\\nuser\\n`` / ``\\nassistant`` boundaries come from the chat-template
+    role markers (e.g. ``<|im_start|>user`` decoded as ``user``).  Everything
+    between ``\\nuser\\n`` and ``\\nassistant`` is system-injected content
+    (``<tool_response>...</tool_response>``).  This helper strips those parts and
+    returns only what the model itself generated.
+
+    For single-turn responses (no ``\\nuser\\n`` marker) the input is returned
+    unchanged.
+
+    Note: the trailing ``\\n`` after ``assistant`` may occasionally be absent
+    (e.g. when tokenizer merges it with the next token), so we match
+    ``\\nassistant`` with an *optional* trailing newline.
+    """
+    user_segments = re.split(r"\nuser\n", response)
+    model_parts = [user_segments[0]]  # first segment is always model output
+    for seg in user_segments[1:]:
+        # seg = "<tool_response>...</tool_response>\nassistant\n<think>..."
+        # Note: \nassistant may or may not be followed by \n
+        assistant_split = re.split(r"\nassistant\n?", seg, maxsplit=1)
+        if len(assistant_split) == 2:
+            model_parts.append(assistant_split[1])
+        # else: malformed turn -- skip the system part safely
+    return "".join(model_parts)
+
+
+# Tools defined in the system prompt.  Any ``<call_tool name="...">`` whose
+# name is NOT in this set is considered a hallucinated / fabricated tool.
+ALLOWED_TOOL_NAMES: frozenset[str] = frozenset({
+    "google_search",
+    "browse_webpage",
+    "snippet_search",
+})
+
+
+def _has_fabricated_tool(response: str) -> bool:
+    """Check if the model used a tool that is not in the allowed list.
+
+    The system prompt defines a fixed set of tools (``google_search``,
+    ``browse_webpage``, ``snippet_search``).  During RL exploration the model
+    may hallucinate tool names that do not exist (e.g. ``download_file``,
+    ``python``, ``search``).  Such calls waste a turn and indicate the model
+    is not following the tool protocol, so they should be penalized.
+
+    This function extracts *all* ``<call_tool name="...">`` occurrences from
+    the model-generated text (system-injected segments are stripped first)
+    and checks whether every tool name belongs to :data:`ALLOWED_TOOL_NAMES`.
+    """
+    model_text = _extract_model_generated_text(response)
+
+    # Extract all <call_tool name="..."> in model text
+    tool_calls = re.findall(r'<call_tool\s+name=["\']?(\w+)', model_text)
+    for name in tool_calls:
+        if name not in ALLOWED_TOOL_NAMES:
+            return True
+    return False
+
+
 def _compute_strict_format_reward(
     response: str, mcp_parser_name: Optional[str] = None, use_full_response_as_answer: bool = False
-) -> float:
-    if use_full_response_as_answer:
-        return -1.0
+) -> dict[str, float]:
+    """Compute strict format reward inspired by R1-Searcher.
 
+    Returns a dict with three keys:
+      - ``format_reward``   : -1.0 or 0.0   (base format correctness)
+      - ``retrieval_reward``: 0.0 or 0.2     (bonus for using tools)
+      - ``sum_format_reward``: format_reward + retrieval_reward
+    """
+    if use_full_response_as_answer:
+        return {"format_reward": -1.0, "retrieval_reward": 0.0, "sum_format_reward": -1.0}
+
+    # --- Condition ①: single <answer> block ---
     answer_blocks = _extract_answer_blocks(response)
     open_count, close_count = count_answer_tags(response)
     has_single_answer_block = len(answer_blocks) == 1 and open_count == 1 and close_count == 1
 
+    # --- Condition ②: <answer> is the last top-level block ---
     answer_is_last_top_level_block = False
     if has_single_answer_block:
         answer_block = answer_blocks[0].group(0).strip()
         answer_is_last_top_level_block = response.strip().endswith(answer_block)
 
-    citation_match = re.search(r"<cite id=[\"\']?[^\"\'>\s]+[\"\']?[^>]*>[^<]+</cite>", response, re.DOTALL)
+    # --- Condition ③: no hallucinated tools ---
     queries = extract_search_tool_calls(response, mcp_parser_name=mcp_parser_name)
+    has_fabrication = _has_fabricated_tool(response) if queries else False
 
-    if has_single_answer_block and answer_is_last_top_level_block and citation_match and queries:
-        return 0.0
-    return -1.0
+    # --- Format reward: all three conditions must be met ---
+    if has_single_answer_block and answer_is_last_top_level_block and not has_fabrication:
+        format_reward = 0.0
+    else:
+        format_reward = -1.0
+
+    # --- Retrieval reward: at least one valid <call_tool> invocation ---
+    retrieval_reward = 0.2 if queries else 0.0
+
+    return {
+        "format_reward": format_reward,
+        "retrieval_reward": retrieval_reward,
+        "sum_format_reward": format_reward + retrieval_reward,
+    }
 
 
 def compute_format_reward(
@@ -181,7 +268,14 @@ def compute_format_reward(
     mcp_parser_name: Optional[str] = None,
     use_full_response_as_answer: bool = False,
     format_penalty: str = "easy",
-) -> float:
+) -> dict[str, float] | float:
+    """Compute format reward.
+
+    Returns:
+        - **strict** mode: ``dict`` with keys ``format_reward``, ``retrieval_reward``,
+          ``sum_format_reward``.
+        - **easy** mode: a single ``float`` (backwards-compatible).
+    """
     format_penalty = _normalize_format_penalty(format_penalty)
     if format_penalty == "strict":
         return _compute_strict_format_reward(
@@ -278,18 +372,29 @@ def compute_score(
     if mcp_parser_name is None and "<call_tool name=" in solution_str:
         mcp_parser_name = "dr_tulu_xml"
 
-    format_reward = compute_format_reward(
+    format_result = compute_format_reward(
         solution_str,
         mcp_parser_name=mcp_parser_name,
         format_penalty=format_penalty,
     )
-    weighted_format_reward = FORMAT_REWARD_WEIGHT * format_reward
+
+    if isinstance(format_result, dict):
+        # strict mode returns a dict
+        format_reward = format_result["format_reward"]
+        retrieval_reward = format_result["retrieval_reward"]
+        sum_format_reward = format_result["sum_format_reward"]
+        effective_format_score = sum_format_reward
+    else:
+        # easy mode returns a float
+        format_reward = format_result
+        effective_format_score = format_reward
+
     answer = extract_solution(solution_str=solution_str)
     is_correct = answer is not None and subem_check(answer, ground_truth["target"])
     reward_score = compute_score_subem(
         solution_str=solution_str,
         ground_truth=ground_truth,
-        format_score=format_reward,
+        format_score=effective_format_score,
         method=method,
         score=score,
     )
@@ -298,6 +403,9 @@ def compute_score(
         "format_reward": format_reward,
         "accuracy_reward": float(is_correct),
     }
-    if format_penalty == "easy":
-        result["weighted_format_reward"] = weighted_format_reward
+    if isinstance(format_result, dict):
+        result["retrieval_reward"] = retrieval_reward
+        result["sum_format_reward"] = sum_format_reward
+    else:
+        result["weighted_format_reward"] = FORMAT_REWARD_WEIGHT * format_reward
     return result
