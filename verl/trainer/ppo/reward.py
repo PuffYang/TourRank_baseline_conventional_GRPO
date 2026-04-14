@@ -47,6 +47,17 @@ async def _call_with_kwargs_async(raw_fn, extra_kwargs, *args, **kwargs):
     return await raw_fn(*args, **merged_kwargs)
 
 
+def _to_plain_dict(value: Any) -> dict:
+    if not value:
+        return {}
+    try:
+        from omegaconf import OmegaConf
+
+        return dict(OmegaConf.to_container(value, resolve=True) or {})
+    except Exception:
+        return dict(value)
+
+
 def get_custom_reward_fn(config: DictConfig) -> Optional[RawRewardFn]:
     """Load and return a custom reward function from external file.
 
@@ -80,6 +91,9 @@ def get_custom_reward_fn(config: DictConfig) -> Optional[RawRewardFn]:
     raw_fn = load_extern_object(module_path=module_path, object_name=fn_name)
 
     reward_kwargs = dict(reward_fn_config.get("reward_kwargs", {}))
+    if getattr(raw_fn, "NEEDS_REWARD_CONFIG", False):
+        reward_kwargs.setdefault("gpt_judge", _to_plain_dict(config.reward.get("gpt_judge", {})))
+        reward_kwargs.setdefault("reward_kwargs", _to_plain_dict(config.reward.get("reward_kwargs", {})))
     if not inspect.iscoroutinefunction(raw_fn):
         return partial(_call_with_kwargs, raw_fn, reward_kwargs)
     else:

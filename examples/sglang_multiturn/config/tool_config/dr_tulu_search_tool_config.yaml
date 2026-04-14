@@ -26,11 +26,6 @@ tools:
     config:
       type: native
       timeout: 30
-      backend: runway
-      url: https://runway.devops.xiaohongshu.com/openai/zhipu/paas/v4/web_search
-      api_key_env: RUNWAY_WEB_SEARCH_API_KEY
-      search_engine: web-reader
-      include_markdown: true
 
   - class_name: verl.tools.dr_tulu_search_tools.DownloadFileTool
     config:

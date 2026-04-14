@@ -336,22 +336,13 @@ class RewardLoopManager:
         if self.reward_model_manager is not None:
             self.reward_model_manager.wake_up()
 
-        use_single_worker_for_judge = (
-            self.config.reward.reward_manager.name == "rubric_gpt_judge"
-            and self.config.reward.get("gpt_judge", {}).get("dispatch_full_batch_to_single_worker", False)
+        chunks = data.chunk(len(self.reward_loop_workers))
+        outputs = ray.get(
+            [
+                worker.compute_score_batch.remote(chunk)
+                for worker, chunk in zip(self.reward_loop_workers, chunks, strict=True)
+            ]
         )
-
-        if use_single_worker_for_judge:
-            # Optional compatibility mode for group-wise judge variants.
-            outputs = [ray.get(self.reward_loop_workers[0].compute_score_batch.remote(data))]
-        else:
-            chunks = data.chunk(len(self.reward_loop_workers))
-            outputs = ray.get(
-                [
-                    worker.compute_score_batch.remote(chunk)
-                    for worker, chunk in zip(self.reward_loop_workers, chunks, strict=True)
-                ]
-            )
         outputs_flat = [item for sublist in outputs for item in sublist]
 
         # compute rm score

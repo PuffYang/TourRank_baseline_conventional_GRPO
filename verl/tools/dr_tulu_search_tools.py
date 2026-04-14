@@ -6,6 +6,7 @@ import os
 import tempfile
 import time
 from typing import Any, Optional
+from urllib.parse import urlparse
 from uuid import uuid4
 
 import requests
@@ -355,47 +356,6 @@ class _DrTuluBaseTool(BaseTool):
             "content": content,
         }
 
-    @classmethod
-    def _extract_runway_web_reader_payload(cls, payload: Any, fallback_url: str) -> dict[str, str]:
-        title = cls._first_text_value(
-            payload,
-            [
-                ("title",),
-                ("data", "title"),
-                ("metadata", "title"),
-            ],
-        )
-        page_url = cls._first_text_value(
-            payload,
-            [
-                ("url",),
-                ("data", "url"),
-                ("metadata", "url"),
-            ],
-        ) or fallback_url
-        content = cls._first_text_value(
-            payload,
-            [
-                ("content",),
-                ("text",),
-                ("markdown",),
-                ("result",),
-                ("data", "content"),
-                ("data", "text"),
-                ("data", "markdown"),
-                ("data", "result"),
-            ],
-        )
-
-        if not content:
-            content = cls._clean_text(payload)
-
-        return {
-            "url": page_url,
-            "title": title,
-            "content": content,
-        }
-
     def _runway_request(self, payload: dict[str, Any]) -> Any:
         response = requests.post(
             self._get_runway_url(),
@@ -412,33 +372,27 @@ class _DrTuluBaseTool(BaseTool):
     def _get_runway_search_engine(self, default: str) -> str:
         return self._clean_text(self.config.get("search_engine")) or default
 
+    @classmethod
+    def _normalize_url(cls, url: Any) -> str:
+        normalized = cls._clean_text(url)
+        if not normalized:
+            return ""
+        if "://" not in normalized:
+            normalized = f"https://{normalized.lstrip('/')}"
+        parsed = urlparse(normalized)
+        if not parsed.scheme or not parsed.netloc:
+            raise ValueError(f"Invalid URL: {normalized}")
+        return normalized
+
 
 class GoogleSearchTool(_DrTuluBaseTool):
     def get_openai_tool_schema(self) -> OpenAIFunctionToolSchema:
-        backend = self._clean_text(self.config.get("backend")).lower() or "serper"
         properties = {
             "query": OpenAIFunctionPropertySchema(
                 type="string",
                 description="The search query.",
             ),
         }
-        if backend != "runway":
-            properties.update(
-                {
-                    "gl": OpenAIFunctionPropertySchema(
-                        type="string",
-                        description="Geolocation country code, e.g. us.",
-                    ),
-                    "hl": OpenAIFunctionPropertySchema(
-                        type="string",
-                        description="Host language code, e.g. en.",
-                    ),
-                    "num_results": OpenAIFunctionPropertySchema(
-                        type="integer",
-                        description="Maximum number of results to return.",
-                    ),
-                }
-            )
 
         return OpenAIFunctionToolSchema(
             type="function",
@@ -458,43 +412,20 @@ class GoogleSearchTool(_DrTuluBaseTool):
         if not query:
             return ToolResponse(text="Error: query is required."), 0.0, {"status": "error"}
 
-        backend = self._clean_text(self.config.get("backend")).lower() or "serper"
-
         def _search():
-            if backend == "runway":
-                search_engine = self._get_runway_search_engine("search_prime")
-                if search_engine != "search_prime":
-                    raise ValueError(
-                        f"google_search with runway backend must use search_engine='search_prime', got '{search_engine}'"
-                    )
-                payload = self._runway_request(
-                    {
-                        "search_engine": search_engine,
-                        "search_query": query,
-                        "query_rewrite": str(self.config.get("query_rewrite", "false")).lower(),
-                    }
+            search_engine = self._get_runway_search_engine("search_prime")
+            if search_engine != "search_prime":
+                raise ValueError(
+                    f"google_search must use search_engine='search_prime', got '{search_engine}'"
                 )
-                return payload
-
-            response = requests.post(
-                "https://google.serper.dev/search",
-                headers={
-                    "X-API-KEY": _require_env_var("SERPER_API_KEY"),
-                    "Content-Type": "application/json",
-                },
-                data=json.dumps(
-                    {
-                        "q": query,
-                        "num": int(parameters.get("num_results", self.config.get("num_results", 5))),
-                        "gl": parameters.get("gl", self.config.get("gl", "us")),
-                        "hl": parameters.get("hl", self.config.get("hl", "en")),
-                        "type": "search",
-                    }
-                ),
-                timeout=self.timeout,
+            payload = self._runway_request(
+                {
+                    "search_engine": search_engine,
+                    "search_query": query,
+                    "query_rewrite": str(self.config.get("query_rewrite", "false")).lower(),
+                }
             )
-            response.raise_for_status()
-            return response.json()
+            return payload
 
         try:
             payload = await asyncio.to_thread(_search)
@@ -525,7 +456,7 @@ class GoogleSearchTool(_DrTuluBaseTool):
             return (
                 ToolResponse(text=self._wrap_tool_output(blocks)),
                 0.0,
-                {"status": "success", "total_results": len(organic_results), "query_count": 1, "backend": backend},
+                {"status": "success", "total_results": len(organic_results), "query_count": 1, "backend": "runway"},
             )
         except Exception as e:
             return ToolResponse(text=f"Error performing google_search: {e}"), 0.0, {"status": "error", "error": str(e)}
@@ -816,60 +747,33 @@ class BrowseWebpageTool(_DrTuluBaseTool):
         if not url:
             return ToolResponse(text="Error: url is required."), 0.0, {"status": "error"}
 
-        backend = self._clean_text(self.config.get("backend")).lower() or "jina"
+        normalized_url = self._normalize_url(url)
 
-        def _browse():
-            if backend == "runway":
-                search_engine = self._get_runway_search_engine("web-reader")
-                if search_engine != "web-reader":
-                    raise ValueError(
-                        f"browse_webpage with runway backend must use search_engine='web-reader', got '{search_engine}'"
-                    )
-                payload = self._runway_request(
-                    {
-                        "search_engine": search_engine,
-                        "url": url,
-                    }
-                )
-                return self._extract_runway_web_reader_payload(payload, fallback_url=url)
-
-            if backend == "serper":
-                response = requests.post(
-                    "https://scrape.serper.dev",
-                    headers={
-                        "X-API-KEY": _require_env_var("SERPER_API_KEY"),
-                        "Content-Type": "application/json",
-                    },
-                    data=json.dumps(
-                        {
-                            "url": url,
-                            "includeMarkdown": bool(self.config.get("include_markdown", True)),
-                        }
-                    ),
-                    timeout=self.timeout,
-                )
-                response.raise_for_status()
-                payload = response.json()
-                return {
-                    "url": url,
-                    "title": payload.get("metadata", {}).get("title", ""),
-                    "content": payload.get("markdown") or payload.get("text") or "",
-                }
-
+        def _browse() -> dict[str, str]:
             response = requests.get(
-                f"https://r.jina.ai/{url}",
-                headers={
-                    "Authorization": f"Bearer {_require_env_var('JINA_API_KEY')}",
-                    "Accept": "application/json",
-                },
+                f"https://r.jina.ai/{normalized_url}",
                 timeout=self.timeout,
             )
             response.raise_for_status()
-            payload = response.json().get("data", {})
+
+            content_type = self._clean_text(response.headers.get("Content-Type")).lower()
+            if "json" in content_type:
+                try:
+                    payload = response.json()
+                except ValueError:
+                    payload = None
+                if isinstance(payload, dict):
+                    extracted = self._extract_webpage_payload(payload.get("data", payload), fallback_url=normalized_url)
+                    if self._clean_text(extracted.get("content")):
+                        return extracted
+
+            text_content = self._clean_text(response.text)
+            if not text_content:
+                raise ValueError("Jina Reader response did not include readable page content")
             return {
-                "url": payload.get("url", url),
-                "title": payload.get("title", ""),
-                "content": payload.get("content", ""),
+                "url": normalized_url,
+                "title": "",
+                "content": text_content,
             }
 
         try:
@@ -877,11 +781,15 @@ class BrowseWebpageTool(_DrTuluBaseTool):
             result_id = self._next_result_id(instance_id, "webpage")
             lines = [
                 f"Title: {self._clean_text(payload.get('title')) or 'No title available'}",
-                f"URL: {self._clean_text(payload.get('url')) or url}",
-                f"Snippet: {self._clean_text(payload.get('content')) or 'No content available'}",
+                f"URL: {self._clean_text(payload.get('url')) or normalized_url}",
+                f"Content: {self._clean_text(payload.get('content')) or 'No content available'}",
             ]
             text = self._wrap_tool_output([f"<webpage id={result_id}>\n" + "\n".join(lines) + "\n</webpage>"])
-            return ToolResponse(text=text), 0.0, {"status": "success", "query_count": 1, "backend": backend}
+            return ToolResponse(text=text), 0.0, {
+                "status": "success",
+                "query_count": 1,
+                "backend": "jina",
+            }
         except Exception as e:
             return ToolResponse(text=f"Error performing browse_webpage: {e}"), 0.0, {"status": "error", "error": str(e)}
 

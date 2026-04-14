@@ -78,11 +78,7 @@ gpt_judge:
   timeout: 200
   max_retries: 3
   retry_sleep: 1.5
-  n_rollouts: ${actor_rollout_ref.rollout.n}
-  strict_n_rollouts: False
   score_normalization: fixed_range
-  dispatch_full_batch_to_single_worker: False
   max_rollout_chars: 12000
   fallback_to_first_on_error: True
-  win_score: 1.0
   lose_score: 0.0

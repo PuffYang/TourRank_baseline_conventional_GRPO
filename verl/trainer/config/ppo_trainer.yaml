@@ -168,35 +168,8 @@ trainer:
     # Prepared DeepResearch Bench validation file name
     deep_research_bench_file: deepresearch_bench_val.jsonl
 
-    # Prepared SQA-CS-V2 validation file name
-    sqa_cs_v2_file: sqa_cs_v2_val.jsonl
-
-    # Prepared HealthBench validation file name
-    healthbench_file: healthbench_val.jsonl
-
-    # Prepared ResearchQA validation file name
-    researchqa_file: researchqa_val.jsonl
-
-    # Grader model used by the HealthBench official evaluator
-    healthbench_grader_model: "gpt-4o"
-
-    # Scorer model used by the SQA-CS-V2 official evaluator
-    sqa_scorer_model: "openai/gpt-4o"
-
-    # Maximum concurrent scorer connections for SQA-CS-V2 evaluation
-    sqa_max_connections: 16
-
     # Maximum concurrent GPT-4o workers for DeepResearch Bench evaluation
     deep_research_bench_max_workers: 10
-
-    # Number of concurrent grading threads for HealthBench evaluation
-    healthbench_n_threads: 120
-
-    # Number of concurrent ResearchQA items to score in parallel
-    researchqa_n_threads: 16
-
-    # Number of rubric items grouped into a single ResearchQA judge call
-    researchqa_batch_size: 10
 
   # Number of nodes used in the training
   nnodes: 1

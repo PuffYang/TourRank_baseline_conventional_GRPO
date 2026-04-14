@@ -69,82 +69,6 @@ def _read_key_value_metrics(path: Path) -> dict[str, float]:
     return metrics
 
 
-def _collect_numeric_metrics(obj: Any, targets: set[str], found: dict[str, float]) -> None:
-    if isinstance(obj, dict):
-        for key, val in obj.items():
-            if key in targets and isinstance(val, (int, float)) and key not in found:
-                found[key] = float(val)
-            _collect_numeric_metrics(val, targets, found)
-        return
-
-    if isinstance(obj, list):
-        for item in obj:
-            _collect_numeric_metrics(item, targets, found)
-
-
-def _scan_json_metrics(root_dir: Path, targets: set[str]) -> dict[str, float]:
-    metrics: dict[str, float] = {}
-    if not root_dir.exists():
-        return metrics
-
-    for path in sorted(root_dir.rglob("*")):
-        if path.suffix.lower() not in {".json", ".jsonl"} or not path.is_file():
-            continue
-
-        try:
-            if path.suffix.lower() == ".json":
-                _collect_numeric_metrics(_read_json(path), targets, metrics)
-            else:
-                with path.open("r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        _collect_numeric_metrics(json.loads(line), targets, metrics)
-        except Exception:
-            continue
-
-    return metrics
-
-
-def _sanitize_metric_key(key: str) -> str:
-    sanitized = []
-    for char in str(key):
-        if char.isalnum() or char in {"_", "-", "."}:
-            sanitized.append(char)
-        else:
-            sanitized.append("_")
-    return "".join(sanitized).strip("_")
-
-
-def _flatten_numeric_metrics(
-    obj: Any,
-    prefix: str = "",
-    skip_keys: set[str] | None = None,
-    out: dict[str, float] | None = None,
-) -> dict[str, float]:
-    if out is None:
-        out = {}
-    if skip_keys is None:
-        skip_keys = set()
-
-    if isinstance(obj, dict):
-        for key, value in obj.items():
-            if key in skip_keys:
-                continue
-            key_str = _sanitize_metric_key(str(key))
-            if not key_str:
-                continue
-            next_prefix = f"{prefix}_{key_str}" if prefix else key_str
-            if isinstance(value, (int, float)):
-                out[next_prefix] = float(value)
-            elif isinstance(value, dict):
-                _flatten_numeric_metrics(value, prefix=next_prefix, skip_keys=skip_keys, out=out)
-        return out
-
-    return out
-
-
 class OODValidationRunner:
     def __init__(self, trainer):
         self.trainer = trainer
@@ -229,24 +153,6 @@ class OODValidationRunner:
                 slug="deepresearch_bench",
                 eval_task="deep_research_bench",
                 file_name=self.config.deep_research_bench_file,
-            ),
-            OODBenchmarkSpec(
-                display_name="SQA-CS-V2",
-                slug="sqa_cs_v2",
-                eval_task="sqa_cs_v2",
-                file_name=self.config.sqa_cs_v2_file,
-            ),
-            OODBenchmarkSpec(
-                display_name="HealthBench",
-                slug="healthbench",
-                eval_task="healthbench",
-                file_name=self.config.healthbench_file,
-            ),
-            OODBenchmarkSpec(
-                display_name="ResearchQA",
-                slug="researchqa",
-                eval_task="researchqa",
-                file_name=self.config.researchqa_file,
             ),
         ]
 
@@ -383,53 +289,9 @@ class OODValidationRunner:
     def _evaluate_generated_outputs(
         self, spec: OODBenchmarkSpec, input_path: Path, benchmark_dir: Path
     ) -> dict[str, Any]:
-        if spec.eval_task in {"healthbench", "researchqa"}:
-            return self._evaluate_with_unified_script(spec, input_path, benchmark_dir)
         if spec.eval_task == "deep_research_bench":
             return self._evaluate_deep_research_bench(spec, input_path, benchmark_dir)
-        if spec.eval_task == "sqa_cs_v2":
-            return self._evaluate_sqa(spec, input_path, benchmark_dir)
         raise ValueError(f"Unsupported OOD benchmark task: {spec.eval_task}")
-
-    def _evaluate_with_unified_script(
-        self, spec: OODBenchmarkSpec, input_path: Path, benchmark_dir: Path
-    ) -> dict[str, Any]:
-        script_path = self._agent_root / "scripts" / "evaluate.py"
-        result_path = benchmark_dir / "eval_results.json"
-        command = [
-            sys.executable,
-            str(script_path),
-            spec.eval_task,
-            str(input_path),
-            "--save_path",
-            str(result_path),
-        ]
-
-        if spec.eval_task == "healthbench":
-            command.extend(
-                [
-                    "--grader-model",
-                    str(self.config.healthbench_grader_model),
-                    "--n-threads",
-                    str(self.config.healthbench_n_threads),
-                ]
-            )
-        elif spec.eval_task == "researchqa":
-            command.extend(
-                [
-                    "--grader-model",
-                    str(self.config.healthbench_grader_model),
-                    "--n-threads",
-                    str(self.config.researchqa_n_threads),
-                    "--batch-size",
-                    str(self.config.researchqa_batch_size),
-                ]
-            )
-
-        self._run_subprocess(command, cwd=self._agent_root, log_dir=benchmark_dir)
-        if not result_path.exists():
-            raise RuntimeError(f"Unified evaluation result not found: {result_path}")
-        return _read_json(result_path)
 
     def _evaluate_deep_research_bench(
         self, spec: OODBenchmarkSpec, input_path: Path, benchmark_dir: Path
@@ -465,39 +327,6 @@ class OODValidationRunner:
             "fact": fact_metrics,
         }
 
-    def _evaluate_sqa(self, spec: OODBenchmarkSpec, input_path: Path, benchmark_dir: Path) -> dict[str, Any]:
-        script_path = self._agent_root / "evaluation" / "sqa_eval" / "run_eval.py"
-        command = [
-            sys.executable,
-            str(script_path),
-            "run",
-            "--input_file",
-            str(input_path),
-            "--output_dir",
-            str(benchmark_dir),
-            "--scorer_model",
-            str(self.config.sqa_scorer_model),
-            "--max_connections",
-            str(self.config.sqa_max_connections),
-        ]
-        self._run_subprocess(command, cwd=self._agent_root, log_dir=benchmark_dir)
-
-        summary_path = benchmark_dir / "summary.json"
-        if summary_path.exists():
-            return _read_json(summary_path)
-
-        metrics = _scan_json_metrics(
-            benchmark_dir,
-            {
-                "global_avg",
-                "ingredient_recall",
-                "answer_precision",
-                "citation_recall",
-                "citation_precision",
-            },
-        )
-        return {"score": metrics.get("global_avg"), "metrics": metrics}
-
     def _run_subprocess(self, command: list[str], cwd: Path, log_dir: Path) -> None:
         env = os.environ.copy()
         completed = subprocess.run(
@@ -530,38 +359,24 @@ class OODValidationRunner:
             if isinstance(race_metrics, dict) and isinstance(race_metrics.get("overall_score"), (int, float)):
                 return float(race_metrics["overall_score"])
             return None
-
-        if spec.eval_task == "sqa_cs_v2":
-            metrics = summary.get("metrics", summary)
-            if isinstance(metrics, dict) and isinstance(metrics.get("global_avg"), (int, float)):
-                return float(metrics["global_avg"])
-            return None
-
-        if isinstance(summary.get("score"), (int, float)):
-            return float(summary["score"])
-
-        metrics = summary.get("metrics", {})
-        if spec.eval_task == "healthbench" and isinstance(metrics.get("overall_score"), (int, float)):
-            return float(metrics["overall_score"])
-        if spec.eval_task == "researchqa" and isinstance(metrics.get("coverage"), (int, float)):
-            return float(metrics["coverage"])
         return None
 
     def _auxiliary_scores(self, spec: OODBenchmarkSpec, summary: dict[str, Any]) -> dict[str, float]:
-        if spec.eval_task == "deep_research_bench":
-            aux_metrics = _flatten_numeric_metrics(
-                summary,
-                skip_keys={"score", "num_examples", "per_example_results", "metadata"},
-            )
-        else:
-            aux_metrics = _flatten_numeric_metrics(
-                summary.get("metrics", {}),
-                skip_keys={"score", "num_examples", "per_example_results", "metadata"},
-            )
+        if spec.eval_task != "deep_research_bench":
+            return {}
+
+        aux_metrics: dict[str, float] = {}
+        for section_name in ("race", "fact"):
+            section_metrics = summary.get(section_name, {})
+            if not isinstance(section_metrics, dict):
+                continue
+            for metric_name, metric_value in section_metrics.items():
+                if isinstance(metric_value, (int, float)):
+                    aux_metrics[f"{section_name}_{metric_name}"] = float(metric_value)
 
         primary_score = self._primary_score(spec, summary)
         if primary_score is not None:
-            for duplicate_key in ("race_overall_score", "global_avg", "coverage", "overall_score"):
+            for duplicate_key in ("race_overall_score", "overall_score"):
                 duplicate_val = aux_metrics.get(duplicate_key)
                 if duplicate_val is not None and abs(duplicate_val - primary_score) < 1e-12:
                     aux_metrics.pop(duplicate_key, None)

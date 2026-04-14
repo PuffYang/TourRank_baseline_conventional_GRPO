@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from verl.experimental.reward_loop.reward_manager.rubric_gpt_judge import (
+from verl.utils.reward_score.rubric_gpt_judge import (
     FORMAT_REWARD_WEIGHT,
-    RubricGPTJudgeRewardManager,
+    _compute_format_reward,
 )
 
 
@@ -26,7 +26,7 @@ def test_compute_format_reward_matches_dr_tulu_weights():
         '<answer><cite id="s1">The next Olympics are in Italy.</cite></answer>'
     )
 
-    reward = RubricGPTJudgeRewardManager._compute_format_reward(response, format_penalty="easy")
+    reward = _compute_format_reward(response, format_penalty="easy")
 
     assert reward == 1.0
     assert FORMAT_REWARD_WEIGHT * reward == 0.2
@@ -35,7 +35,7 @@ def test_compute_format_reward_matches_dr_tulu_weights():
 def test_compute_format_reward_is_partial_when_only_answer_exists():
     response = "<answer>Just the answer.</answer>"
 
-    reward = RubricGPTJudgeRewardManager._compute_format_reward(response, format_penalty="easy")
+    reward = _compute_format_reward(response, format_penalty="easy")
 
     assert reward == 0.5
 
@@ -47,7 +47,7 @@ def test_compute_format_reward_supports_strict_success_case():
         '<answer><cite id="s1">The next Olympics are in Italy.</cite></answer>'
     )
 
-    reward = RubricGPTJudgeRewardManager._compute_format_reward(response, format_penalty="strict")
+    reward = _compute_format_reward(response, format_penalty="strict")
 
     assert reward == 0.0
     assert FORMAT_REWARD_WEIGHT * reward == 0.0
@@ -60,7 +60,7 @@ def test_compute_format_reward_supports_strict_failure_case():
         '<think>extra trailing block</think>'
     )
 
-    reward = RubricGPTJudgeRewardManager._compute_format_reward(response, format_penalty="strict")
+    reward = _compute_format_reward(response, format_penalty="strict")
 
     assert reward == -1.0
     assert FORMAT_REWARD_WEIGHT * reward == -0.2
